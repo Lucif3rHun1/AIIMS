@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"log"
+	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,22 +14,34 @@ import (
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("🚀 AIIMS Bot Starting...")
+	logFile, err := os.OpenFile("bot.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		slog.Error("open log file", "error", err)
+		os.Exit(1)
+	}
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	handler := slog.NewTextHandler(multiWriter, &slog.HandlerOptions{Level: slog.LevelInfo})
+	slog.SetDefault(slog.New(handler))
+	defer logFile.Close()
+
+	slog.Info("AIIMS Bot Starting...")
 
 	cfg, err := config.LoadConfig("config.json")
 	if err != nil {
-		log.Fatalf("Config load failed: %v", err)
+		slog.Error("config load failed", "error", err)
+		os.Exit(1)
 	}
 
 	if err := cfg.Validate(); err != nil {
-		log.Fatalf("Invalid config: %v", err)
+		slog.Error("invalid config", "error", err)
+		os.Exit(1)
 	}
-	log.Println(cfg.Redact())
+	slog.Info("config loaded", "config", cfg.Redact())
 
 	botSvc, err := bot.NewBotService(cfg)
 	if err != nil {
-		log.Fatalf("Bot init failed: %v", err)
+		slog.Error("bot init failed", "error", err)
+		os.Exit(1)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -39,18 +52,17 @@ func main() {
 
 	go func() {
 		<-sigChan
-		log.Println("⏳ Shutdown signal received, stopping gracefully...")
-		botSvc.Stop()
-		cancel()
-
 		go func() {
 			time.Sleep(15 * time.Second)
-			log.Println("⚠️ Forced shutdown after timeout")
+			slog.Warn("forced shutdown after timeout")
 			os.Exit(1)
 		}()
+		slog.Info("shutdown signal received, saving state and stopping gracefully...")
+		botSvc.Stop()
+		cancel()
 	}()
 
-	log.Println("🟢 Bot is running...")
-	botSvc.Start(ctx)
-	log.Println("👋 Bot stopped.")
+	slog.Info("bot is running...")
+	botSvc.Start(ctx, cfg.OwnerID)
+	slog.Info("bot stopped.")
 }

@@ -13,7 +13,10 @@ type Token struct {
 }
 
 func (t *Token) IsExpired() bool {
-	return t.ExpiresAt.Before(time.Now().Add(30 * time.Minute))
+	if t.ExpiresAt.IsZero() {
+		return true
+	}
+	return t.ExpiresAt.Before(time.Now().Add(5 * time.Minute))
 }
 
 type Patient struct {
@@ -33,6 +36,53 @@ func (p *Patient) PrimaryHealthID() string {
 type ValidatedPatient struct {
 	Patient        Patient
 	ValidationDone bool
+}
+
+type ABHAProfile struct {
+	Name         string `json:"name"`
+	ABHAAddress  string `json:"abha_address"`
+	KYCVerified  string `json:"kyc_verified"`
+}
+
+type LoginInitResponse struct {
+	TxnID string `json:"txn_id"`
+	Hint  string `json:"hint"`
+}
+
+type LoginVerifyResponse struct {
+	TxnID       string        `json:"txn_id"`
+	SkipState   string        `json:"skip_state"`
+	Hint        string        `json:"hint"`
+	ABHAProfiles []ABHAProfile `json:"abha_profiles"`
+	EKA         struct {
+		MinToken string `json:"min_token"`
+	} `json:"eka"`
+}
+
+type LoginPHRResponse struct {
+	TxnID     string `json:"txn_id"`
+	SkipState string `json:"skip_state"`
+	Hint      string `json:"hint"`
+	Profile   struct {
+		ABHAAddress string `json:"abha_address"`
+		FirstName   string `json:"first_name"`
+		LastName    string `json:"last_name"`
+		Mobile      string `json:"mobile"`
+	} `json:"profile"`
+	EKA struct {
+		UUID     string `json:"uuid"`
+		OID      string `json:"oid"`
+		MinToken string `json:"min_token"`
+	} `json:"eka"`
+}
+
+type AortagoVerifyResponse struct {
+	Data struct {
+		Tokens struct {
+			Sess    string `json:"sess"`
+			Refresh string `json:"refresh"`
+		} `json:"tokens"`
+	} `json:"data"`
 }
 
 type BurstResult struct {

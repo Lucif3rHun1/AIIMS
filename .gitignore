@@ -1,34 +1,53 @@
+# Credentials
 config.json
 config.local.json
 secrets.json
 credentials.json
+*.key
+*.pem
 
+# Binaries
 bot
+aiims-appointment-bot
+arogya-bot
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 
+# Test/build artifacts
 *.test
 *.out
 *.prof
+coverage.txt
+coverage.html
 
-.DS_Store
+# Logs
 *.log
+
+# OS/editor junk
+.DS_Store
 *.tmp
 *.swp
 *.swo
 *~
+.vscode/
+.idea/
 
+# Environment
+.env
+.env.*
+
+# Run output (may contain patient data)
 results/
 results_flow/
 results_sequential/
 
-.vscode/
-.idea/
-.env
-.env.*
-
+# Agent tooling
 .sisyphus/
 .omc/
+.codegraph/
+
+# Stream captures (SENSITIVE)
+Stream Sniffed*

@@ -3,7 +3,8 @@ package notify
 import (
 	"context"
 	"fmt"
-	"log"
+	"html"
+	"log/slog"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -56,7 +57,7 @@ func (n *Notifier) Send(ctx context.Context, text string, parseMode string) erro
 		if _, err := n.bot.Send(msg); err != nil {
 			lastErr = err
 			delay := retryBaseDelay * time.Duration(1<<attempt)
-			log.Printf("[notify] attempt %d failed: %v, retrying in %v", attempt, err, delay)
+			slog.Warn("send attempt failed", "component", "notify", "attempt", attempt, "error", err, "retry_after", delay)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -73,45 +74,43 @@ func (n *Notifier) SendHTML(ctx context.Context, text string) error {
 	return n.Send(ctx, text, tgbotapi.ModeHTML)
 }
 
-func (n *Notifier) SendMarkdown(ctx context.Context, text string) error {
-	return n.Send(ctx, text, tgbotapi.ModeMarkdown)
-}
-
 func FormatAppointmentSuccess(patientName, healthID, tokenNumber, hipName, tokenExpiry, footer string) string {
 	return fmt.Sprintf(
-		"✅ *Appointment Confirmed*\n\n"+
-			"👤 Patient: `%s`\n"+
+		"✅ <b>Appointment Confirmed</b>\n\n"+
+			"👤 Patient: <code>%s</code>\n"+
 			"🏥 Hospital: %s\n"+
-			"🎫 Token: `%s`\n"+
+			"🎫 Token: <code>%s</code>\n"+
 			"⏰ Valid Until: %s\n"+
 			"📋 %s",
-		patientName, hipName, tokenNumber, tokenExpiry, footer,
+		html.EscapeString(patientName), html.EscapeString(hipName),
+		html.EscapeString(tokenNumber), html.EscapeString(tokenExpiry),
+		html.EscapeString(footer),
 	)
 }
 
 func FormatQueueUpdate(patientName string, queuePos, totalInQueue int) string {
 	return fmt.Sprintf(
-		"⏳ *Queue Update*\n\n"+
-			"👤 Patient: `%s`\n"+
+		"⏳ <b>Queue Update</b>\n\n"+
+			"👤 Patient: <code>%s</code>\n"+
 			"📊 Position: %d / %d",
-		patientName, queuePos, totalInQueue,
+		html.EscapeString(patientName), queuePos, totalInQueue,
 	)
 }
 
 func FormatValidationStatus(patientName string, validated, total int, errMsg string) string {
 	if errMsg != "" {
 		return fmt.Sprintf(
-			"❌ *Validation Failed*\n\n"+
-				"👤 Patient: `%s`\n"+
+			"❌ <b>Validation Failed</b>\n\n"+
+				"👤 Patient: <code>%s</code>\n"+
 				"⚠️ Error: %s",
-			patientName, errMsg,
+			html.EscapeString(patientName), html.EscapeString(errMsg),
 		)
 	}
 	return fmt.Sprintf(
-		"🔐 *Validation Progress*\n\n"+
-			"👤 Patient: `%s`\n"+
+		"🔐 <b>Validation Progress</b>\n\n"+
+			"👤 Patient: <code>%s</code>\n"+
 			"✅ Validated: %d / %d",
-		patientName, validated, total,
+		html.EscapeString(patientName), validated, total,
 	)
 }
 
@@ -123,41 +122,44 @@ func FormatBurstResult(patientName string, success bool, tokenNumber string) str
 		)
 	}
 	return fmt.Sprintf(
-		"❌ *Booking Failed*\n\n"+
-			"👤 Patient: `%s`\n"+
+		"❌ <b>Booking Failed</b>\n\n"+
+			"👤 Patient: <code>%s</code>\n"+
 			"⚠️ All burst attempts exhausted",
-		patientName,
+		html.EscapeString(patientName),
 	)
 }
 
 func FormatExecutionStart(totalPatients int, targetTime string) string {
 	return fmt.Sprintf(
-		"🚀 *Execution Started*\n\n"+
+		"🚀 <b>Execution Started</b>\n\n"+
 			"👥 Patients: %d\n"+
 			"🎯 Target: %s\n"+
 			"⏰ Time: %s",
-		totalPatients, targetTime, time.Now().Format("02-01-2006 15:04:05"),
+		totalPatients, html.EscapeString(targetTime), time.Now().Format("02-01-2006 15:04:05"),
 	)
 }
 
 func FormatExecutionComplete(successCount, failCount int32, total int) string {
+	rate := float64(0)
+	if total > 0 {
+		rate = float64(successCount) / float64(total) * 100
+	}
 	return fmt.Sprintf(
-		"📊 *Execution Complete*\n\n"+
+		"📊 <b>Execution Complete</b>\n\n"+
 			"✅ Success: %d\n"+
 			"❌ Failed: %d\n"+
 			"👥 Total: %d\n"+
 			"📈 Rate: %.0f%%",
-		successCount, failCount, total,
-		float64(successCount)/float64(total)*100,
+		successCount, failCount, total, rate,
 	)
 }
 
 func BuildStatusMessage(validated, total int, successCount, failCount int32, running bool) string {
 	if !running {
-		return "🟢 *System Online*\n\nIdle — no task running."
+		return "🟢 <b>System Online</b>\n\nIdle — no task running."
 	}
 	return fmt.Sprintf(
-		"🟡 *Task Running*\n\n"+
+		"🟡 <b>Task Running</b>\n\n"+
 			"✅ Validated: %d / %d\n"+
 			"🎫 Appointments: %d\n"+
 			"❌ Failed: %d",

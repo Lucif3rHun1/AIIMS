@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "saved_at": "2026-05-25T02:56:24.499558+05:30",
+  "current_state": "Idle",
+  "state_account_id": "",
+  "login_states": {},
+  "otp_waiters": [],
+  "running_tasks": [],
+  "pending_date": false,
+  "pending_phone": false
+}
