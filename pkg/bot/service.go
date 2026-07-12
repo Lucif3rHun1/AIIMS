@@ -80,6 +80,7 @@ type BotService struct {
 
 	loginStates map[string]*loginState
 	otpWaiters  map[string]chan string
+	otpGate     sync.Mutex // serializes OTP requests so only one account asks at a time (ponytail: single global lock; per-account gates if throughput matters)
 
 	// State machine
 	state          BotState
@@ -941,6 +942,13 @@ func (b *BotService) clearAllSelections(chatID int64, messageID int) {
 
 func (b *BotService) makeGetOTPCallback(chatID int64, accountID string) func(string) (string, error) {
 	return func(healthID string) (string, error) {
+		// Serialize OTP collection: only one account may request + wait for its
+		// OTP at a time. Otherwise all accounts fire MsgOTPRequired at once and
+		// the multi-OTP format is required, which fails when one phone maps to
+		// several ABHA accounts.
+		b.otpGate.Lock()
+		defer b.otpGate.Unlock()
+
 		otpCh := make(chan string, 1)
 
 		b.mu.Lock()
