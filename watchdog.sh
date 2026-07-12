@@ -25,28 +25,45 @@ BROADCAST_ID="$(cfg broadcast_chat_id)"
 : "${CHAT_ID:?owner_id missing in $CONFIG_FILE}"
 : "${BROADCAST_ID:?broadcast_chat_id missing in $CONFIG_FILE}"
 
-# Wait until 5:58 AM IST
-NOW=$(date +%s)
-TARGET=$(date -j -f "%Y-%m-%d %H:%M:%S" "$(date +%Y-%m-%d) 05:58:00" +%s 2>/dev/null || date -d "$(date +%Y-%m-%d) 05:58:00" +%s)
-if [ "$TARGET" -lt "$NOW" ]; then
-  # Already past 5:58, target already passed or about to pass today
-  TARGET=$(date -j -f "%Y-%m-%d %H:%M:%S" "$(date +%Y-%m-%d) 06:00:00" +%s 2>/dev/null || date -d "$(date +%Y-%m-%d) 06:00:00" +%s)
+# Ensure the bot is running (it creates bot.log). Launch it if not already up.
+BOT_BIN="$BOT_DIR/bot"
+if ! pgrep -f "[b]ot" >/dev/null 2>&1; then
+  echo "[$(date '+%H:%M:%S')] Bot not running - starting it..."
+  ( cd "$BOT_DIR" && nohup ./bot >> "$LOG_FILE" 2>&1 & )
 fi
 
-WAIT_SECS=$((TARGET - NOW))
+# Wait for bot.log to appear (the bot creates it on startup)
+LOG_WAIT=0
+while [ ! -f "$LOG_FILE" ] && [ "$LOG_WAIT" -lt 30 ]; do
+  sleep 1
+  LOG_WAIT=$((LOG_WAIT + 1))
+done
+if [ ! -f "$LOG_FILE" ]; then
+  echo "ERROR: bot.log not found - bot failed to start (check config.json and permissions)"
+  exit 1
+fi
+
+# Wait until 5:58 AM IST before monitoring the daily run
+target_today()    { date -j -f "%Y-%m-%d %H:%M:%S" "$(date +%Y-%m-%d) 05:58:00" +%s 2>/dev/null || date -d "today 05:58:00" +%s; }
+target_tomorrow() { date -j -v+1d -f "%Y-%m-%d %H:%M:%S" "$(date +%Y-%m-%d) 05:58:00" +%s 2>/dev/null || date -d "tomorrow 05:58:00" +%s; }
+NOW=$(date +%s)
+TARGET=$(target_today)
+if [ "${WATCHDOG_NOWAIT:-0}" = "1" ]; then
+  WAIT_SECS=0
+elif [ "$TARGET" -lt "$NOW" ]; then
+  # Past today's window: wait until tomorrow 05:58 (don't false-alert now)
+  TARGET=$(target_tomorrow)
+  WAIT_SECS=$((TARGET - NOW))
+else
+  WAIT_SECS=$((TARGET - NOW))
+fi
+
 if [ "$WAIT_SECS" -gt 0 ]; then
   echo "[$(date '+%H:%M:%S')] Watchdog sleeping ${WAIT_SECS}s until 05:58 AM IST..."
   sleep $WAIT_SECS
 fi
 
 echo "[$(date '+%H:%M:%S')] Watchdog ACTIVE - monitoring bot.log"
-
-# Capture the last position in log file
-if [ ! -f "$LOG_FILE" ]; then
-  echo "ERROR: bot.log not found"
-  exit 1
-fi
-
 LOG_SIZE=$(wc -c < "$LOG_FILE" | tr -d ' ')
 
 # Monitor for execution logs until 6:05 AM

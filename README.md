@@ -62,23 +62,27 @@ The bot loads `config.json` from its working directory at startup.
 
 ## Watchdog (daily monitoring)
 
-`watchdog.sh` runs the booking routine daily at **05:58 IST**, monitors `bot.log`, and:
+`./bot` is a **persistent service** — it stays running, handles Telegram updates, and self-schedules the daily booking at ~05:58 IST.
 
+`watchdog.sh` keeps that service alive and verifies each day's run:
+- if the bot process isn't running, it **starts** it (in the project dir, output → `bot.log`)
+- waits for `bot.log` (the bot creates it on startup)
+- sleeps until **05:58 IST**, then monitors `bot.log` for the run result
 - on success → sends a summary to `broadcast_chat_id`
-- on failure → sends a Telegram retry alert to `owner_id`
+- on failure (no confirmation before 06:05) → sends a Telegram retry alert to `owner_id`
 
-It reads `telegram_bot_token`, `owner_id`, and `broadcast_chat_id` from `config.json` (no secrets in the script).
+It reads `telegram_bot_token`, `owner_id`, and `broadcast_chat_id` from `config.json` (no secrets in the script). `python3` is required.
 
-Schedule with cron (runs every day at 05:58):
+Schedule with cron (runs every day; the script self-aligns to 05:58):
 
 ```cron
 58 5 * * * /bin/bash /path/to/AIIMS/watchdog.sh >> /path/to/AIIMS/cron.log 2>&1
 ```
 
-Run once manually to test:
+Run once manually to test (skips the wait-to-05:58 so it runs immediately):
 
 ```bash
-bash watchdog.sh
+WATCHDOG_NOWAIT=1 bash watchdog.sh
 ```
 
 ## Security
