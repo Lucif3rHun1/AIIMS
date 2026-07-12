@@ -6,8 +6,8 @@ credentials.json
 *.key
 *.pem
 
-# Binaries
-bot
+# Binaries (anchored to repo root so pkg/bot and cmd/bot source stay tracked)
+/bot
 aiims-appointment-bot
 arogya-bot
 *.exe
