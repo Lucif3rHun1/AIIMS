@@ -1,0 +1,20 @@
+.git
+.omc
+.omo
+.codegraph
+.sisyphus
+docs
+tests
+bot
+bot_state.json
+config.json
+config.local.json
+secrets.json
+*.log
+*.key
+*.pem
+.DS_Store
+results/
+results_flow/
+results_sequential/
+Stream Sniffed*

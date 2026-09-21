@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.aiims.bot</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__REPO__/bot</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>__REPO__</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>AIIMS_MASTER_KEY</key>
+		<string>__AIIMS_MASTER_KEY__</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>__REPO__/bot_stdout.log</string>
+	<!-- Go runtime panic traces go to stderr; the bot only redirects slog, so
+	     without this a crash leaves no stack trace anywhere. -->
+	<key>StandardErrorPath</key>
+	<string>__REPO__/bot_stderr.log</string>
+</dict>
+</plist>

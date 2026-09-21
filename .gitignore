@@ -26,6 +26,11 @@ coverage.html
 # Logs
 *.log
 
+# Runtime state (rewritten by the running bot; contains phone-number account IDs)
+bot_state.json
+bot_state.json.tmp
+appointments.db*
+
 # OS/editor junk
 .DS_Store
 *.tmp
@@ -47,6 +52,7 @@ results_sequential/
 # Agent tooling
 .sisyphus/
 .omc/
+.omo/
 .codegraph/
 
 # Stream captures (SENSITIVE)
