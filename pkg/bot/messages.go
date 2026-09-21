@@ -4,51 +4,81 @@ import (
 	"fmt"
 	"html"
 	"strings"
+	"time"
 )
+
+// tag renders an account label as a "[name] " prefix, or nothing when the
+// label is empty. With a single account running, the prefix is pure noise.
+// plural avoids the "1 patient(s)" look.
+func plural(n int, word string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, word)
+	}
+	return fmt.Sprintf("%d %ss", n, word)
+}
+
+func tag(label string) string {
+	if label == "" {
+		return ""
+	}
+	return "[" + html.EscapeString(label) + "] "
+}
+
+// accountSuffix names the account count only when it is worth saying.
+func accountSuffix(accounts int) string {
+	if accounts <= 1 {
+		return ""
+	}
+	return fmt.Sprintf(" across %d accounts", accounts)
+}
+
+func MsgChooseProfileExpired() string {
+	return "⚠️ That profile list has expired. Start the login again."
+}
 
 // Welcome / Help
 
 func MsgWelcomeNoAccounts() string {
-	return "👋 Welcome to AIIMS Appointment Bot!\n\n👤 No accounts yet. Tap '👤 Accounts' to add one and get started."
+	return "👋 Welcome to AIIMS Appointment Bot!\n\n👤 No accounts yet. Tap ➕ Add account to get started."
 }
 
 func MsgWelcomeNoActive() string {
-	return "👋 Welcome to AIIMS Appointment Bot!\n\n👤 Account exists but none active. Tap '👤 Accounts' to select one."
+	return "👋 Welcome to AIIMS Appointment Bot!\n\n👤 Tap 👤 Accounts to pick one."
 }
 
 func MsgWelcomeNotLoggedIn(name string) string {
-	return "👋 Welcome!\n\n👤 Active: <b>" + html.EscapeString(name) + "</b>\n🔑 Not logged in. Tap '👤 Accounts' to authenticate."
+	return "👋 Welcome!\n\n👤 Active: <b>" + html.EscapeString(name) + "</b>\n🔑 Not logged in. Tap 🔐 Log in."
 }
 
 func MsgWelcomeLoggedInNoPatients(name, phone string) string {
-	return "👋 Welcome!\n\n👤 Active: <b>" + html.EscapeString(name) + "</b>\n📱 " + html.EscapeString(phone) + "\n✅ Logged in.\n\n👥 Tap '🔄 Fetch Patients' to load patient list."
+	return "👋 Welcome!\n\n👤 Active: <b>" + html.EscapeString(name) + "</b>\n📱 " + html.EscapeString(phone) + "\n✅ Logged in.\n\n👥 Tap 🔄 Load patients."
 }
 
 func MsgWelcomePatientsNoneSelected(name, phone string, total int) string {
-	return "👋 Welcome!\n\n👤 Active: <b>" + html.EscapeString(name) + "</b>\n📱 " + html.EscapeString(phone) + "\n👥 " + fmt.Sprintf("%d", total) + " patients loaded.\n\n👆 Tap '🔄 Fetch Patients' to refresh, then select patients for booking."
+	return "👋 Welcome!\n\n👤 Active: <b>" + html.EscapeString(name) + "</b>\n📱 " + html.EscapeString(phone) + "\n👥 " + fmt.Sprintf("%d", total) + " patients loaded.\n\n👆 Tap 👥 Choose patients to pick who to book for."
 }
 
 func MsgWelcomeReadyNoDate(name string, selected, total int) string {
-	return fmt.Sprintf("👋 Welcome!\n\n👤 Active: <b>%s</b>\n👥 %d/%d patients selected.\n\n📅 Tap '▶️ Run All Accounts' to choose date and start booking.",
+	return fmt.Sprintf("👋 Welcome!\n\n👤 Active: <b>%s</b>\n👥 %d/%d patients selected.\n\n📅 Tap <b>Book</b> to pick a date and start.",
 		html.EscapeString(name), selected, total)
 }
 
 func MsgWelcomeReady(name string, selected int, targetDate string) string {
-	return fmt.Sprintf("👋 Welcome!\n\n👤 Active: <b>%s</b>\n👥 %d patients selected\n📅 Target: %s\n\n🚀 Tap '▶️ Run All Accounts' to start booking.",
+	return fmt.Sprintf("👋 Welcome!\n\n👤 Active: <b>%s</b>\n👥 %d patients selected\n📅 Target: %s\n\n🚀 Tap 📅 Book to choose a date and start.",
 		html.EscapeString(name), selected, html.EscapeString(targetDate))
 }
 
 func MsgHelp() string {
 	return "📖 <b>AIIMS Bot Help</b>\n\n" +
-		"<b>Quick Start:</b>\n" +
-		"1. 👤 Accounts → ➕ Add Account → Enter phone → OTP → Login\n" +
-		"2. 🔄 Fetch Patients → Select patients → ✅ Done\n" +
-		"3. ▶️ Run → Choose date → Bot books at 06:00 AM IST\n\n" +
+		"<b>Quick start</b> — the menu always shows your next step:\n" +
+		"• ➕ Add account → enter phone → enter the OTP you receive\n" +
+		"• 🔄 Load patients → 👥 Choose patients → 💾 Save\n" +
+		"• 📅 Book → pick a date → the bot books at 06:00 AM IST\n\n" +
 		"<b>Tips:</b>\n" +
-		"• Add multiple accounts and run all simultaneously\n" +
-		"• Tap ❌ Cancel during any step to go back\n" +
+		"• Add multiple accounts and book them all at once\n" +
+		"• Send /cancel at any point to get unstuck\n" +
 		"• 📊 Status shows all account details\n" +
-		"• ⚙️ Settings for HIP ID, bot token, etc."
+		"• ⚙️ Settings holds the HIP ID and broadcast chat"
 }
 
 // Cancel
@@ -92,7 +122,7 @@ func MsgNoTasksRunning() string {
 // Account management
 
 func MsgNoAccounts() string {
-	return "👤 No accounts configured. Use ➕ Add Account to create one."
+	return "👤 No accounts yet.\n\nTap ➕ Add account to get started."
 }
 
 func MsgAccountsMenu() string {
@@ -111,17 +141,8 @@ func MsgAccountAdded(phone string) string {
 	return "✅ Account <b>" + html.EscapeString(phone) + "</b> added and activated!\n\n🔐 Initiating login..."
 }
 
-func MsgLoginCompleteFetchPatients() string {
-	return "✅ Login complete! You can now fetch patients. Tap 🔄 Fetch Patients to continue."
-}
-
 func MsgAccountNotFound() string {
 	return "❌ Account not found."
-}
-
-func MsgSwitchedAccount(name, phone, hipID string) string {
-	return fmt.Sprintf("✅ Switched to <b>%s</b>\n📱 %s\n🏥 HIP: %s",
-		html.EscapeString(name), html.EscapeString(phone), html.EscapeString(hipID))
 }
 
 func MsgNoAccountsToRemove() string {
@@ -151,7 +172,7 @@ func MsgLoginFailed(err string) string {
 }
 
 func MsgLoginTimedOut() string {
-	return "❌ Login timed out (7 min)"
+	return "❌ Login timed out.\n\nTap 🔐 Log in to start over."
 }
 
 func MsgLoginCancelled() string {
@@ -159,57 +180,41 @@ func MsgLoginCancelled() string {
 }
 
 func MsgSessionExpired() string {
-	return "⚠️ Session expired. Starting fresh login..."
+	return "⚠️ Session expired — signing in again."
 }
 
 func MsgLoginFailedManual() string {
-	return "❌ Login failed. Use 🔐 Login to authenticate manually, then try fetching again."
+	return "❌ Login failed.\n\nTap 🔐 Log in to try again."
 }
 
 func MsgSessionInvalidAfterLogin() string {
-	return "❌ Session still invalid after login. Please try /start and authenticate again."
-}
-
-func MsgInitiatingLogin(phone string) string {
-	return "🔄 Initiating login for " + html.EscapeString(phone) + "..."
+	return "❌ Session still invalid.\n\nTap 🔐 Log in to retry."
 }
 
 func MsgOTPInput(hint string) string {
 	return "📱 " + html.EscapeString(hint) + "\n\nPlease enter the OTP received:"
 }
 
-func MsgAutoSelectedProfile(name, phr string) string {
-	return fmt.Sprintf("✅ Auto-selected profile: %s (%s)", html.EscapeString(name), html.EscapeString(phr))
-}
-
 func MsgMultiProfileSelect(profiles string, count int) string {
-	return fmt.Sprintf("👥 Multiple ABHA profiles found:\n\n%s\n\nEnter the number (1-%d) to select:", profiles, count)
+	return fmt.Sprintf("👥 <b>%d ABHA profiles</b> on this number:\n\n%s\n\n👆 Tap the one to use:", count, profiles)
 }
 
 func MsgProfileLine(idx int, verified, name, abhaAddress string) string {
 	return fmt.Sprintf("%d. %s %s <code>%s</code>", idx, verified, html.EscapeString(name), html.EscapeString(abhaAddress))
 }
 
-func MsgSelectedProfile(name, phr string) string {
-	return fmt.Sprintf("✅ Selected: %s (%s)", html.EscapeString(name), html.EscapeString(phr))
-}
-
-func MsgExchangingTokens() string {
-	return "🔄 Exchanging tokens..."
-}
-
 func MsgTokensSaveFailed(err string) string {
 	return "⚠️ Tokens obtained but config save failed: " + html.EscapeString(err)
 }
 
-func MsgLoginSuccess(expiry string) string {
-	return "✅ Login successful!\n\n🔑 Session token expires: <code>" + html.EscapeString(expiry) + "</code>\n📝 Config saved.\n\nNext: Tap 🔄 Fetch Patients to load patient list."
+func MsgLoginSuccess(profileName string) string {
+	return "✅ Signed in as <b>" + html.EscapeString(profileName) + "</b>"
 }
 
 // OTP
 
-func MsgOTPRequired(accountID, healthID string) string {
-	return fmt.Sprintf("🔐 [%s] OTP Required for %s. Please enter the OTP:", html.EscapeString(accountID), html.EscapeString(healthID))
+func MsgOTPRequired(label, patientName string) string {
+	return fmt.Sprintf("🔐 %sOTP required for <b>%s</b>\n\nEnter the 6-digit code:", tag(label), html.EscapeString(patientName))
 }
 
 func MsgOTPChannelBusy() string {
@@ -236,11 +241,11 @@ func MsgMultiOTPNeeded(accountIDs []string, exampleID string) string {
 // Patient management
 
 func MsgNoActiveAccount() string {
-	return "❌ No active account. Use 👤 Accounts to add one."
+	return "❌ No active account.\n\nTap 👤 Accounts to pick or add one."
 }
 
 func MsgFetchingPatients() string {
-	return "⏳ Fetching patients... (Step 1/4)"
+	return "⏳ Fetching patients..."
 }
 
 func MsgFetchInternalError() string {
@@ -255,9 +260,11 @@ func MsgFetchSaveFailed(err string) string {
 	return "⚠️ Patients fetched but save failed: " + html.EscapeString(err)
 }
 
-func MsgPatientsFound(phone string, count, selectedCount, total int) string {
-	return fmt.Sprintf("✅ Found <b>%d patients</b> for %s (Step 1/4 complete)\n\n👆 Select/deselect patients below, then tap ✅ Done (Step 2/4)\n<i>%d/%d currently selected</i>",
-		count, html.EscapeString(phone), selectedCount, total)
+// The live count lives on the Save button only. It used to also sit in this
+// text, which never re-rendered on a toggle, so the sentence and the keyboard
+// drifted apart ("3/4 selected" above a keyboard showing 1).
+func MsgPatientsFound(count int) string {
+	return fmt.Sprintf("✅ Found <b>%d patients</b>.\n\n👆 Tap names to select, then 💾 Save.", count)
 }
 
 func MsgPatientKeyboardFailed() string {
@@ -265,7 +272,7 @@ func MsgPatientKeyboardFailed() string {
 }
 
 func MsgPatientsSelected(count int) string {
-	return fmt.Sprintf("✅ %d patient(s) selected. (Step 2/4 complete)\n\n📅 Tap '▶️ Run All Accounts' to choose appointment date. (Step 3/4)", count)
+	return fmt.Sprintf("✅ Saved — <b>%s</b> selected.", plural(count, "patient"))
 }
 
 func MsgNoPatientsSelected() string {
@@ -278,12 +285,8 @@ func MsgNoActiveAccountDate() string {
 	return "❌ No active account."
 }
 
-func MsgDateStep() string {
-	return "📅 Step 3/4: Choose appointment date"
-}
-
 func MsgDateSelectTarget() string {
-	return "📅 Select target date for execution:"
+	return "📅 Choose the appointment date:"
 }
 
 func MsgDateCustomFormat() string {
@@ -302,10 +305,6 @@ func MsgTasksAlreadyRunning() string {
 	return "⚠️ Tasks already running. Stop them first."
 }
 
-func MsgDateSet(dateStr string) string {
-	return "✅ Date set: " + html.EscapeString(dateStr) + " (06:00 AM IST) (Step 3/4 complete)\n\n🚀 Step 4/4: Starting booking..."
-}
-
 // Execution / Burst
 
 func MsgNoAccountsConfigured() string {
@@ -316,24 +315,24 @@ func MsgNoPatientsSelectedAny() string {
 	return "❌ No patients selected in any account."
 }
 
-func MsgExecutionStart(count int, timeStr, dateStr string) string {
-	return fmt.Sprintf("🚀 Step 4/4: Starting execution for <b>%d</b> account(s) at %s IST (%s)...", count, html.EscapeString(timeStr), html.EscapeString(dateStr))
+func MsgExecutionStart(patients, accounts int, timeStr, dateStr string) string {
+	return fmt.Sprintf("🚀 Booking <b>%s</b>%s\n📅 %s at %s IST", plural(patients, "patient"), accountSuffix(accounts), html.EscapeString(dateStr), html.EscapeString(timeStr))
 }
 
 func MsgRunnerPanic(name string, panicVal interface{}) string {
-	return fmt.Sprintf("💥 [%s] Unexpected error (recovered): %v", html.EscapeString(name), panicVal)
+	return fmt.Sprintf("%s💥 Unexpected error (recovered): %v", tag(name), panicVal)
 }
 
 func MsgTaskFailed(name string, err error) string {
-	return fmt.Sprintf("❌ [%s] Task failed: %v", html.EscapeString(name), err)
+	return fmt.Sprintf("%s❌ Failed: %v", tag(name), err)
 }
 
 func MsgTaskCompleted(name string) string {
-	return fmt.Sprintf("✅ [%s] Task completed.", html.EscapeString(name))
+	return tag(name) + "✅ Booking run finished."
 }
 
 func MsgRunnerProgress(name, msg string) string {
-	return fmt.Sprintf("[%s] %s", html.EscapeString(name), msg)
+	return tag(name) + msg
 }
 
 // Settings
@@ -406,4 +405,62 @@ func MsgPrewarmTokenReady(patient string, ready, total int) string {
 
 func MsgPrewarmComplete(ready, failed, total int) string {
 	return fmt.Sprintf("🔥 <b>Pre-Warm Complete</b>\n\n✅ Ready: %d\n❌ Failed: %d\n👥 Total: %d\n\n⏳ Waiting for T-0...", ready, failed, total)
+}
+
+// MsgUnrecognizedInput replies to text the bot was not expecting, so a typed
+// message is never silently swallowed.
+func MsgUnrecognizedInput() string {
+	return "🤔 I wasn't expecting that.\n\nUse the buttons below, or send /help to see what I can do."
+}
+
+// MsgStaleKeyboard covers a keyboard rendered before the patient list changed.
+func MsgStaleKeyboard() string {
+	return "⚠️ That patient list is out of date.\n\nTap 🔄 to reload it."
+}
+
+// MsgTargetInPast refuses a booking whose slot has already passed.
+func MsgTargetInPast(t time.Time) string {
+	return fmt.Sprintf("⏰ <b>%s has already passed.</b>\n\nBooking was not started — it would fire immediately instead of waiting for the slot.\n\nPick a later date.",
+		html.EscapeString(t.Format("02 Jan 2006, 15:04")))
+}
+
+// MsgOTPRetry re-prompts after a rejected OTP instead of killing the login.
+func MsgOTPRetry(left int) string {
+	return fmt.Sprintf("❌ That OTP was not accepted.\n\nPlease re-enter the 6-digit code — <b>%d attempt(s) left</b>.", left)
+}
+
+// MsgResumeSkipped explains why an interrupted booking was not auto-resumed.
+func MsgResumeSkipped(account string, target time.Time) string {
+	if target.IsZero() {
+		return fmt.Sprintf("⚠️ Could not auto-resume <b>%s</b>: the booking slot was not recorded.\n\nStart it again with 📅 Book.",
+			html.EscapeString(account))
+	}
+	return fmt.Sprintf("⚠️ Could not auto-resume <b>%s</b>: its slot (%s) has already passed.\n\nStart it again with 📅 Book.",
+		html.EscapeString(account), html.EscapeString(target.Format("02 Jan 2006, 15:04")))
+}
+
+func MsgUnknownCommand(cmd string) string {
+	return "🤔 Unknown command /" + html.EscapeString(cmd) + ".\n\nTry /start, /status, /cancel, /stop or /help."
+}
+
+func MsgNoPatientsLoaded() string {
+	return "👥 No patients loaded yet.\n\nTap 🔄 to load them from your ABHA account first."
+}
+
+// No count here on purpose: this text is sent once and never re-rendered, while
+// the Save button below it updates on every tap. Two owners, guaranteed drift.
+func MsgChoosePatients(selected, total int) string {
+	return "👥 <b>Choose patients</b>\n\nTap a name to add or remove it, then 💾 Save."
+}
+
+func MsgAccountExistsReLogin(phone string) string {
+	return "👤 <b>" + html.EscapeString(phone) + "</b> already exists — keeping its patients and selections.\n\n🔐 Logging in again..."
+}
+
+func MsgFieldNotEditable(field string) string {
+	return "🔒 <b>" + html.EscapeString(field) + "</b> cannot be changed from chat.\n\nEdit config.json and restart the bot."
+}
+
+func MsgInvalidFieldValue(field, reason string) string {
+	return "❌ Could not set <b>" + html.EscapeString(field) + "</b>: " + html.EscapeString(reason) + "\n\nTry again, or send /cancel."
 }

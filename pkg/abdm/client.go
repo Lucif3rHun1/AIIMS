@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -74,7 +75,7 @@ func (tm *defaultTokenManager) RefreshMasterToken() error {
 	for attempt := 1; attempt <= MaxRetryAttempts; attempt++ {
 		slog.Warn("token refresh attempt", "component", "token", "attempt", attempt, "max_attempts", MaxRetryAttempts)
 		body, status, err := makeHTTPCall(tm.ctx, tm.httpClient, "POST", "https://aortago.eka.care/phr/v3/auth/refresh", payload, tm.masterToken)
-		slog.Debug("token refresh response", "component", "token", "status", status, "error", err, "body", truncate(string(body), 200))
+		slog.Debug("token refresh response", "component", "token", "status", status, "error", err)
 		if err == nil && status == 200 {
 			var respObj map[string]interface{}
 			if err := json.Unmarshal(body, &respObj); err != nil {
@@ -90,18 +91,18 @@ func (tm *defaultTokenManager) RefreshMasterToken() error {
 				continue
 			}
 
-			deviceID, _ := generateSecureUUID()
+			deviceID, _ := GenerateSecureUUID()
 
 			tm.masterToken = &Token{
 				Auth:      sess,
 				Sess:      sess,
 				Refresh:   refresh,
 				DeviceID:  deviceID,
-				ExpiresAt: parseJWTExpiry(sess),
+				ExpiresAt: ParseJWTExpiry(sess),
 			}
 
 			tm.config.UpdateTokens(sess, refresh)
-			slog.Info("tokens refreshed and persisted", "component", "token", "expires", parseJWTExpiry(sess).Format("15:04:05"))
+			slog.Info("tokens refreshed and persisted", "component", "token", "expires", ParseJWTExpiry(sess).Format("15:04:05"))
 
 			return nil
 		}
@@ -139,14 +140,14 @@ func (tm *defaultTokenManager) GetPatientToken(patientOID string) (*Token, error
 	sess := switchResponse["sess"]
 	refresh := switchResponse["refresh"]
 
-	deviceID, _ := generateSecureUUID()
+	deviceID, _ := GenerateSecureUUID()
 
 	return &Token{
 		Auth:      sess,
 		Sess:      sess,
 		Refresh:   refresh,
 		DeviceID:  deviceID,
-		ExpiresAt: parseJWTExpiry(sess),
+		ExpiresAt: ParseJWTExpiry(sess),
 	}, nil
 }
 
@@ -165,6 +166,11 @@ func NewHTTPClient() *http.Client {
 }
 
 func makeHTTPCall(ctx context.Context, client HTTPClient, method, url string, payload interface{}, token *Token) ([]byte, int, error) {
+	body, status, _, err := makeHTTPCallWithRetryAfter(ctx, client, method, url, payload, token)
+	return body, status, err
+}
+
+func makeHTTPCallWithRetryAfter(ctx context.Context, client HTTPClient, method, url string, payload interface{}, token *Token) ([]byte, int, time.Duration, error) {
 	var body []byte
 	if payload != nil {
 		body, _ = json.Marshal(payload)
@@ -175,7 +181,7 @@ func makeHTTPCall(ctx context.Context, client HTTPClient, method, url string, pa
 
 	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	headers := map[string]string{
@@ -199,12 +205,20 @@ func makeHTTPCall(ctx context.Context, client HTTPClient, method, url string, pa
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	defer resp.Body.Close()
 
+	retryAfter := time.Duration(0)
+	if seconds, err := strconv.Atoi(resp.Header.Get("Retry-After")); resp.StatusCode == 429 && err == nil && seconds > 0 {
+		if seconds > 60 {
+			seconds = 60
+		}
+		retryAfter = time.Duration(seconds) * time.Second
+	}
+
 	respBody, err := readLimitedResponse(resp, MaxResponseSize)
-	return respBody, resp.StatusCode, err
+	return respBody, resp.StatusCode, retryAfter, err
 }
 
 func readLimitedResponse(resp *http.Response, maxSize int64) ([]byte, error) {
@@ -221,7 +235,7 @@ func readLimitedResponse(resp *http.Response, maxSize int64) ([]byte, error) {
 	return io.ReadAll(limitedReader)
 }
 
-func generateSecureUUID() (string, error) {
+func GenerateSecureUUID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -229,7 +243,7 @@ func generateSecureUUID() (string, error) {
 	return fmt.Sprintf("%X-%X-%X-%X-%X", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
 }
 
-func parseJWTExpiry(token string) time.Time {
+func ParseJWTExpiry(token string) time.Time {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return time.Time{}
@@ -243,32 +257,17 @@ func parseJWTExpiry(token string) time.Time {
 	return time.Time{}
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
-}
-
 func (tm *defaultTokenManager) UpdateMasterToken(sess, refresh string) {
 	tm.mutex.Lock()
 	defer tm.mutex.Unlock()
-	deviceID, _ := generateSecureUUID()
+	deviceID, _ := GenerateSecureUUID()
 	tm.masterToken = &Token{
 		Auth:      sess,
 		Sess:      sess,
 		Refresh:   refresh,
 		DeviceID:  deviceID,
-		ExpiresAt: parseJWTExpiry(sess),
+		ExpiresAt: ParseJWTExpiry(sess),
 	}
-}
-
-func ParseJWTExpiry(token string) time.Time {
-	return parseJWTExpiry(token)
-}
-
-func GenerateSecureUUID() (string, error) {
-	return generateSecureUUID()
 }
 
 type ABDMLogin struct {
@@ -281,13 +280,13 @@ func NewABDMLogin() *ABDMLogin {
 
 func abdmHeaders() map[string]string {
 	return map[string]string{
-		"Content-Type":     "application/json",
-		"client-id":        "patient-app-ios",
+		"Content-Type":       "application/json",
+		"client-id":          "patient-app-ios",
 		"x-abha-sdk-version": "1.0.0",
-		"User-Agent":       "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
-		"Origin":           "file://",
-		"Accept":           "*/*",
-		"Accept-Language":  "en-US,en;q=0.9",
+		"User-Agent":         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+		"Origin":             "file://",
+		"Accept":             "*/*",
+		"Accept-Language":    "en-US,en;q=0.9",
 	}
 }
 
@@ -298,7 +297,7 @@ func (al *ABDMLogin) InitLogin(ctx context.Context, phone string) (*LoginInitRes
 		return nil, fmt.Errorf("login init request failed: %v", err)
 	}
 	if status != 200 {
-		return nil, fmt.Errorf("login init failed: status %d body %s", status, truncate(string(body), 300))
+		return nil, fmt.Errorf("login init failed: status %d", status)
 	}
 
 	var resp LoginInitResponse
@@ -318,7 +317,7 @@ func (al *ABDMLogin) VerifyOTP(ctx context.Context, txnID, otp string) (*LoginVe
 		return nil, fmt.Errorf("verify request failed: %v", err)
 	}
 	if status != 200 {
-		return nil, fmt.Errorf("verify failed: status %d body %s", status, truncate(string(body), 300))
+		return nil, fmt.Errorf("verify failed: status %d", status)
 	}
 
 	var resp LoginVerifyResponse
@@ -335,7 +334,7 @@ func (al *ABDMLogin) SelectPHR(ctx context.Context, txnID, phrAddress string) (*
 		return nil, fmt.Errorf("phr select request failed: %v", err)
 	}
 	if status != 200 {
-		return nil, fmt.Errorf("phr select failed: status %d body %s", status, truncate(string(body), 300))
+		return nil, fmt.Errorf("phr select failed: status %d", status)
 	}
 
 	var resp LoginPHRResponse
@@ -356,7 +355,7 @@ func (al *ABDMLogin) ExchangeMinToken(ctx context.Context, minToken, oid string)
 		return "", "", fmt.Errorf("token exchange request failed: %v", err)
 	}
 	if status != 200 {
-		return "", "", fmt.Errorf("token exchange failed: status %d body %s", status, truncate(string(body), 300))
+		return "", "", fmt.Errorf("token exchange failed: status %d", status)
 	}
 
 	var resp AortagoVerifyResponse

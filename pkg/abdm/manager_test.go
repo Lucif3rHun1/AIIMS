@@ -234,7 +234,7 @@ func TestPersistentSpam_TransientErrorsDontConfirm(t *testing.T) {
 
 	// Simulate: 200 with token, then 429 (transient), then 200 with same token
 	tracker.Record("18") // count=1
-	tracker.Record("")    // 429 returns empty → resets
+	tracker.Record("")   // 429 returns empty → resets
 	tracker.Record("18") // count=1 (reset)
 	tracker.Record("18") // count=2
 	tracker.Record("18") // count=3 → confirmed

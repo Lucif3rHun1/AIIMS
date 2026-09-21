@@ -2,16 +2,26 @@ package config
 
 import (
 	"aiims-appointment/pkg/crypto"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 )
 
 const DefaultTimezone = "Asia/Kolkata"
+
+// saveMu serialises the snapshot-through-rename window of Save. Without it two
+// concurrent savers each write a whole-config snapshot and the later rename
+// rolls back the other account's freshly refreshed tokens.
+// ponytail: one global save lock; per-file locks only if save contention ever
+// shows up in profiles.
+var saveMu sync.Mutex
 
 type Config struct {
 	mu sync.RWMutex `json:"-"`
@@ -76,6 +86,45 @@ func (c *Config) SetBroadcastChatID(chatID int64) {
 	c.BroadcastChatID = chatID
 }
 
+// SetField writes one of the chat-editable scalar fields under the lock.
+func (c *Config) SetField(field, value string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch field {
+	case "hip_id":
+		c.HipID = value
+	case "bot_token":
+		c.TelegramBotToken = value
+	case "owner_id":
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid owner_id '%s': %w", value, err)
+		}
+		c.OwnerID = n
+	case "broadcast_chat_id":
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid broadcast_chat_id '%s': %w", value, err)
+		}
+		c.BroadcastChatID = n
+	default:
+		return fmt.Errorf("unknown config field: %s", field)
+	}
+	return nil
+}
+
+func (c *Config) GetBroadcastChatID() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.BroadcastChatID
+}
+
+func (c *Config) GetHipID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.HipID
+}
+
 func (c *Config) GetActiveAccount() *Account {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -83,6 +132,18 @@ func (c *Config) GetActiveAccount() *Account {
 		return nil
 	}
 	return c.Accounts[c.ActiveAccountID]
+}
+
+func (c *Config) GetAccount(id string) *Account {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Accounts[id]
+}
+
+func (c *Config) HasAccount(id string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Accounts[id] != nil
 }
 
 func (c *Config) SetActiveAccount(id string) bool {
@@ -131,7 +192,7 @@ func (c *Config) RenameAccount(id, newName string) bool {
 	if acc == nil {
 		return false
 	}
-	acc.Name = newName
+	acc.SetName(newName)
 	return true
 }
 
@@ -229,11 +290,14 @@ func (c *Config) Clone() *Config {
 }
 
 func (c *Config) Save(path string) error {
+	saveMu.Lock()
+	defer saveMu.Unlock()
+
 	clone := c.Clone()
 
-	// Encrypt tokens at rest if master key is configured
+	// Encrypt tokens at rest if master key is configured. The clone is
+	// discarded after the write, so it is never decrypted back.
 	clone.encryptTokens()
-	defer clone.decryptTokens()
 
 	data, err := json.MarshalIndent(clone, "", "  ")
 	if err != nil {
@@ -269,6 +333,9 @@ func (c *Config) Save(path string) error {
 }
 
 // encryptTokens encrypts all sensitive token fields in-place for disk storage.
+// ponytail: ciphertext is unmarked, so saving while the master key is wrong
+// re-encrypts the preserved ciphertext and recovery then needs both keys.
+// Upgrade path: a version byte prefix, so Encrypt can refuse a value it wrote.
 func (c *Config) encryptTokens() {
 	if !crypto.Enabled() {
 		return
@@ -294,12 +361,17 @@ func (c *Config) decryptTokens() {
 	if !crypto.Enabled() {
 		return
 	}
-	var err error
-	if c.AuthToken, err = crypto.Decrypt(c.AuthToken); err != nil {
-		slog.Error("decrypt auth_token failed", "component", "config", "error", err)
+	// On failure the field keeps its ciphertext: overwriting a good token with
+	// "" would destroy it on the next Save (key rotation must not lose data).
+	if v, err := crypto.Decrypt(c.AuthToken); err != nil {
+		slog.Error("decrypt auth_token failed, keeping stored value", "component", "config", "error", err)
+	} else {
+		c.AuthToken = v
 	}
-	if c.RefreshToken, err = crypto.Decrypt(c.RefreshToken); err != nil {
-		slog.Error("decrypt refresh_token failed", "component", "config", "error", err)
+	if v, err := crypto.Decrypt(c.RefreshToken); err != nil {
+		slog.Error("decrypt refresh_token failed, keeping stored value", "component", "config", "error", err)
+	} else {
+		c.RefreshToken = v
 	}
 	for _, acc := range c.Accounts {
 		acc.decryptTokens()
@@ -336,6 +408,13 @@ func LoadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// AccountKey is the log-safe stand-in for an account id. Account ids are phone
+// numbers, so they must never reach a log line verbatim.
+func AccountKey(id string) string {
+	h := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(h[:6])
+}
+
 func (c *Config) Redact() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -345,9 +424,9 @@ func (c *Config) Redact() string {
 		}
 		return s[:4] + "..." + s[len(s)-4:]
 	}
-	active := c.ActiveAccountID
-	if active == "" {
-		active = "none"
+	active := "none"
+	if c.ActiveAccountID != "" {
+		active = AccountKey(c.ActiveAccountID)
 	}
 	return fmt.Sprintf("Config{Accounts:%d Active:%s Bot:%s Owner:%d Broadcast:%d Hip:%s}",
 		len(c.Accounts), active,

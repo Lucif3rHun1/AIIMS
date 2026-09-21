@@ -26,21 +26,33 @@ func convertPatients(configPatients []config.Patient) []abdm.Patient {
 }
 
 type accountRunner struct {
-	accountID    string
-	accountName  string
-	patients     []abdm.Patient
-	manager      *abdm.ABDMManager
-	cancel       context.CancelFunc
+	accountID   string
+	accountName string
+	patients    []abdm.Patient
+
+	// target and startedAt are read by SaveState so a crash can resume this run
+	// at its real slot instead of guessing.
+	target    time.Time
+	startedAt time.Time
+
+	// mu guards manager and cancel: start() writes them from the runner
+	// goroutine while stop() reads them from whichever goroutine cancels.
+	mu      sync.Mutex
+	manager *abdm.ABDMManager
+	cancel  context.CancelFunc
+
 	running      atomic.Bool
 	successCount atomic.Int32
 	failCount    atomic.Int32
 }
 
-func newAccountRunner(accountID, accountName string, selectedPatients []config.Patient) *accountRunner {
+func newAccountRunner(accountID, accountName string, selectedPatients []config.Patient, target time.Time) *accountRunner {
 	return &accountRunner{
 		accountID:   accountID,
 		accountName: accountName,
 		patients:    convertPatients(selectedPatients),
+		target:      target,
+		startedAt:   time.Now(),
 	}
 }
 
@@ -53,9 +65,13 @@ func (r *accountRunner) start(ctx context.Context, cfg *config.Config, targetTim
 	defer r.running.Store(false)
 
 	taskCtx, cancel := context.WithCancel(ctx)
+	r.mu.Lock()
 	r.cancel = cancel
+	r.mu.Unlock()
 	defer func() {
+		r.mu.Lock()
 		r.cancel = nil
+		r.mu.Unlock()
 		cancel()
 	}()
 
@@ -64,7 +80,9 @@ func (r *accountRunner) start(ctx context.Context, cfg *config.Config, targetTim
 	}
 
 	manager := abdm.NewABDMManager(cfg, taskCtx)
+	r.mu.Lock()
 	r.manager = manager
+	r.mu.Unlock()
 	manager.SendMessage = sendMsg
 	manager.GetOTP = getOTP
 	manager.OnStatus = onStatus
@@ -73,25 +91,29 @@ func (r *accountRunner) start(ctx context.Context, cfg *config.Config, targetTim
 		return fmt.Errorf("init failed for %s: %v", r.accountName, err)
 	}
 
-	slog.Info("validating patients", "component", "runner", "count", len(r.patients), "account", r.accountName)
+	slog.Info("validating patients", "component", "runner", "count", len(r.patients), "account_key", accountKey(r.accountID))
 	if err := manager.ValidatePatients(r.patients); err != nil {
 		return fmt.Errorf("validation failed for %s: %v", r.accountName, err)
 	}
 
 	validated := manager.GetValidatedPool()
-	slog.Info("patients validated", "component", "runner", "validated", len(validated), "total", len(r.patients), "account", r.accountName)
+	slog.Info("patients validated", "component", "runner", "validated", len(validated), "total", len(r.patients), "account_key", accountKey(r.accountID))
 
 	return manager.ExecuteTaskWithRenewal(targetTime)
 }
 
 func (r *accountRunner) stop() {
-	if r.cancel != nil {
-		r.cancel()
-		r.cancel = nil
+	r.mu.Lock()
+	cancel, manager := r.cancel, r.manager
+	r.cancel, r.manager = nil, nil
+	r.mu.Unlock()
+
+	// Close() blocks for up to 10s; never call it holding a lock others need.
+	if cancel != nil {
+		cancel()
 	}
-	if r.manager != nil {
-		r.manager.Close()
-		r.manager = nil
+	if manager != nil {
+		manager.Close()
 	}
 }
 
@@ -108,12 +130,16 @@ func newRunnerRegistry() *runnerRegistry {
 
 func (rr *runnerRegistry) add(r *accountRunner) {
 	rr.mu.Lock()
-	defer rr.mu.Unlock()
-	if existing, ok := rr.runners[r.accountID]; ok {
-		slog.Info("stopping existing runner", "component", "runner", "account", existing.accountName)
+	existing := rr.runners[r.accountID]
+	rr.runners[r.accountID] = r
+	rr.mu.Unlock()
+
+	// stop() blocks up to 10s inside manager.Close(). Holding rr.mu across it
+	// froze every other registry reader — status, stop-all, the whole menu.
+	if existing != nil {
+		slog.Info("stopping existing runner", "component", "runner", "account_key", accountKey(existing.accountID))
 		existing.stop()
 	}
-	rr.runners[r.accountID] = r
 }
 
 func (rr *runnerRegistry) remove(accountID string) {
@@ -150,23 +176,25 @@ func (rr *runnerRegistry) anyRunning() bool {
 }
 
 func (rr *runnerRegistry) stopAll() {
-	rr.mu.RLock()
+	rr.mu.Lock()
 	runners := make([]*accountRunner, 0, len(rr.runners))
 	for _, r := range rr.runners {
 		runners = append(runners, r)
 	}
-	rr.mu.RUnlock()
-
-	for _, r := range runners {
-		slog.Info("stopping runner", "component", "runner", "account", r.accountName)
-		r.stop()
-	}
-
-	rr.mu.Lock()
-	for k := range rr.runners {
-		delete(rr.runners, k)
-	}
+	rr.runners = make(map[string]*accountRunner)
 	rr.mu.Unlock()
+
+	// Each stop() can take 10s. Serially that overruns main's 15s force-exit
+	// as soon as there are two accounts, and the process dies with code 1.
+	var wg sync.WaitGroup
+	for _, r := range runners {
+		wg.Add(1)
+		go func(r *accountRunner) {
+			defer wg.Done()
+			r.stop()
+		}(r)
+	}
+	wg.Wait()
 }
 
 func (rr *runnerRegistry) count() int {

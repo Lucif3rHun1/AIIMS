@@ -2,8 +2,10 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"aiims-appointment/pkg/abdm"
+	"aiims-appointment/pkg/appointments"
 	"aiims-appointment/pkg/config"
 	"aiims-appointment/pkg/notify"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -61,13 +64,61 @@ func (s BotState) String() string {
 }
 
 type loginState struct {
-	phase string
-	otpCh chan string
-	phrCh chan string
+	phase  string
+	otpCh  chan string
+	phrCh  chan string
+	cancel context.CancelFunc
+}
+
+const (
+	// otpInputTimeout and phrInputTimeout bound how long we wait on the human.
+	// loginFlowTimeout must exceed their sum plus network time, or the outer
+	// deadline fires while an inner wait is still legitimately running.
+	otpInputTimeout  = 5 * time.Minute
+	phrInputTimeout  = 2 * time.Minute
+	loginFlowTimeout = 10 * time.Minute
+	maxOTPAttempts   = 3
+
+	// fetchNetworkTimeout covers network work ONLY. It must never span an
+	// interactive login, which blocks on a human reading an SMS.
+	fetchNetworkTimeout = 30 * time.Second
+)
+
+// istLoc is resolved once. cmd/bot imports _ "time/tzdata" so the lookup
+// cannot fail, and the fixed fallback makes a nil *Location — which panics
+// inside time.Date — impossible regardless.
+var istLoc = func() *time.Location {
+	if l, err := time.LoadLocation("Asia/Kolkata"); err == nil {
+		return l
+	}
+	slog.Error("tz database unavailable, using fixed +05:30", "component", "bot")
+	return time.FixedZone("IST", 5*60*60+30*60)
+}()
+
+// safego runs fn in a goroutine behind a panic barrier. Without it a panic in
+// any handler goroutine takes the whole process down.
+func safego(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("goroutine panic recovered", "component", "bot",
+					"goroutine", name, "panic", r, "stack", string(debug.Stack()))
+			}
+		}()
+		fn()
+	}()
+}
+
+// telegramAPI is the slice of *tgbotapi.BotAPI the service actually uses.
+// Depending on the interface instead of the struct is what lets the whole
+// message/keyboard flow be driven in tests without a Telegram token.
+type telegramAPI interface {
+	Send(tgbotapi.Chattable) (tgbotapi.Message, error)
+	Request(tgbotapi.Chattable) (*tgbotapi.APIResponse, error)
 }
 
 type BotService struct {
-	bot      *tgbotapi.BotAPI
+	bot      telegramAPI
 	config   *config.Config
 	notifier *notify.Notifier
 	updates  tgbotapi.UpdatesChannel
@@ -85,7 +136,6 @@ type BotService struct {
 	// State machine
 	state          BotState
 	stateAccountID string
-	stateCancelCh  chan struct{}
 
 	waitingForDate  bool
 	pendingDateChat int64
@@ -96,19 +146,28 @@ type BotService struct {
 	sendQueue chan outgoingMsg
 	sendWg    sync.WaitGroup
 
-	msgCache   map[int64]int
-	msgCacheMu sync.RWMutex
-
 	tokenRefresher *TokenRefresher
+
+	appointments *appointments.Store // optional; nil if disabled
 }
 
-func NewBotService(cfg *config.Config) (*BotService, error) {
+func NewBotService(cfg *config.Config, apptStore *appointments.Store) (*BotService, error) {
 	bot, err := tgbotapi.NewBotAPI(cfg.TelegramBotToken)
 	if err != nil {
 		return nil, err
 	}
 
 	slog.Info("bot authorized", "username", bot.Self.UserName)
+
+	if _, err := bot.Request(tgbotapi.NewSetMyCommands(
+		tgbotapi.BotCommand{Command: "start", Description: "Show the main menu"},
+		tgbotapi.BotCommand{Command: "cancel", Description: "Cancel whatever is in progress"},
+		tgbotapi.BotCommand{Command: "status", Description: "Show account and booking status"},
+		tgbotapi.BotCommand{Command: "stop", Description: "Stop all running bookings"},
+		tgbotapi.BotCommand{Command: "help", Description: "How to use this bot"},
+	)); err != nil {
+		slog.Warn("could not register bot commands", "component", "bot", "error", err)
+	}
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -124,15 +183,15 @@ func NewBotService(cfg *config.Config) (*BotService, error) {
 	}
 
 	svc := &BotService{
-		bot:         bot,
-		config:      cfg,
-		notifier:    notifier,
-		updates:     updates,
-		registry:    newRunnerRegistry(),
-		loginStates: make(map[string]*loginState),
-		otpWaiters:  make(map[string]chan string),
-		sendQueue:   make(chan outgoingMsg, 100),
-		msgCache:    make(map[int64]int),
+		bot:          bot,
+		config:       cfg,
+		notifier:     notifier,
+		updates:      updates,
+		registry:     newRunnerRegistry(),
+		loginStates:  make(map[string]*loginState),
+		otpWaiters:   make(map[string]chan string),
+		sendQueue:    make(chan outgoingMsg, 100),
+		appointments: apptStore,
 	}
 	svc.tokenRefresher = NewTokenRefresher(cfg)
 	svc.sendWg.Add(1)
@@ -149,7 +208,14 @@ func (b *BotService) Start(ctx context.Context, chatID int64) {
 		case <-ctx.Done():
 			b.running.Store(false)
 			return
-		case update := <-b.updates:
+		case update, ok := <-b.updates:
+			if !ok {
+				// A closed channel returns instantly forever: without this the
+				// loop spins a core at 100% and the bot is silently deaf.
+				slog.Error("telegram update channel closed, stopping", "component", "bot")
+				b.running.Store(false)
+				return
+			}
 			b.handleUpdate(ctx, update)
 		}
 	}
@@ -172,28 +238,37 @@ func (b *BotService) sendWorker() {
 	for msg := range b.sendQueue {
 		tgMsg := tgbotapi.NewMessage(msg.chatID, msg.text)
 		tgMsg.ParseMode = tgbotapi.ModeHTML
-		sent, err := b.bot.Send(tgMsg)
-		if err != nil {
+		if _, err := b.bot.Send(tgMsg); err != nil {
 			slog.Error("send message failed", "component", "bot", "error", err)
-			continue
 		}
-		b.msgCacheMu.Lock()
-		b.msgCache[msg.chatID] = sent.MessageID
-		b.msgCacheMu.Unlock()
 	}
 }
 
 func (b *BotService) send(chatID int64, text string) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Warn("send after shutdown", "component", "bot", "panic", r)
+		}
+	}()
 	b.mu.RLock()
 	queue := b.sendQueue
 	b.mu.RUnlock()
-	if queue == nil {
-		return
-	}
 	select {
 	case queue <- outgoingMsg{chatID: chatID, text: text}:
 	default:
 		slog.Warn("send queue full, dropping message", "component", "bot")
+	}
+}
+
+// sendWithCancel sends a prompt with a Cancel button attached. Text prompts
+// without one strand the user, which is what happened on the OTP screen.
+func (b *BotService) sendWithCancel(chatID int64, text string) {
+	m := tgbotapi.NewMessage(chatID, text)
+	m.ParseMode = tgbotapi.ModeHTML
+	m.ReplyMarkup = GetCancelKeyboard()
+	if _, err := b.bot.Send(m); err != nil {
+		slog.Error("send prompt failed", "component", "bot", "error", err)
+		b.send(chatID, text)
 	}
 }
 
@@ -202,19 +277,15 @@ func (b *BotService) sendHTML(chatID int64, text string) {
 	b.send(chatID, text)
 }
 
-func (b *BotService) editOrSend(chatID int64, text string) {
-	b.msgCacheMu.RLock()
-	lastMsgID, exists := b.msgCache[chatID]
-	b.msgCacheMu.RUnlock()
-
-	if exists {
-		edit := tgbotapi.NewEditMessageText(chatID, lastMsgID, text)
-		edit.ParseMode = tgbotapi.ModeHTML
-		if _, err := b.bot.Send(edit); err != nil {
-			b.send(chatID, text)
-		}
-	} else {
-		b.send(chatID, text)
+// broadcast delivers booking-run output to the chat that started the run and
+// mirrors it to the broadcast channel. Status events used to go to the channel
+// *instead of* the chat, so whoever pressed the button saw nothing after
+// "Waiting...". The equality check stops a run started inside the broadcast
+// group from posting everything twice.
+func (b *BotService) broadcast(ctx context.Context, chatID int64, text string) {
+	b.sendHTML(chatID, text)
+	if b.notifier.HasChannel() && b.config.GetBroadcastChatID() != chatID {
+		b.notifyChannel(ctx, text)
 	}
 }
 
@@ -229,37 +300,19 @@ func (b *BotService) notifyChannel(ctx context.Context, text string) {
 
 func (b *BotService) SetState(state BotState, accountID string) {
 	b.mu.Lock()
-	if b.stateCancelCh != nil {
-		close(b.stateCancelCh)
-	}
 	b.state = state
 	b.stateAccountID = accountID
-	b.stateCancelCh = make(chan struct{})
-	slog.Info("bot state changed", "component", "bot", "state", state.String(), "account_id", accountID)
+	slog.Info("bot state changed", "component", "bot", "state", state.String(), "account_key", accountKey(accountID))
 	b.mu.Unlock()
 	b.SaveState()
 }
 
 func (b *BotService) ClearState() {
 	b.mu.Lock()
-	if b.stateCancelCh != nil {
-		select {
-		case <-b.stateCancelCh:
-		default:
-			close(b.stateCancelCh)
-		}
-	}
 	b.state = StateIdle
 	b.stateAccountID = ""
-	b.stateCancelCh = nil
 	b.mu.Unlock()
 	b.SaveState()
-}
-
-func (b *BotService) StateCancelCh() <-chan struct{} {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.stateCancelCh
 }
 
 func (b *BotService) CurrentState() BotState {
@@ -268,21 +321,33 @@ func (b *BotService) CurrentState() BotState {
 	return b.state
 }
 
-func (b *BotService) CancelCurrentFlow(chatID int64) {
+// resetFlow abandons any half-finished interaction: a pending login, a phone
+// or date prompt, a settings edit. Every stuck state must be escapable.
+func (b *BotService) resetFlow() {
 	b.ClearState()
 	b.mu.Lock()
+	for _, ls := range b.loginStates {
+		if ls.cancel != nil {
+			ls.cancel()
+		}
+	}
 	b.waitingForPhone = false
 	b.phoneInputChat = 0
 	b.waitingForDate = false
 	b.pendingDateChat = 0
+	b.editingField = ""
 	b.mu.Unlock()
 	b.SaveState()
+}
 
-	b.send(chatID, MsgCancelled())
-	m := tgbotapi.NewMessage(chatID, "Main Menu")
+func (b *BotService) CancelCurrentFlow(chatID int64) {
+	b.resetFlow()
+	m := tgbotapi.NewMessage(chatID, MsgCancelled())
 	m.ParseMode = tgbotapi.ModeHTML
-	m.ReplyMarkup = GetMainMenu()
-	b.bot.Send(m)
+	m.ReplyMarkup = b.mainMenu()
+	if _, err := b.bot.Send(m); err != nil {
+		slog.Error("send main menu failed", "component", "bot", "error", err)
+	}
 }
 
 func (b *BotService) handleUpdate(ctx context.Context, update tgbotapi.Update) {
@@ -294,7 +359,18 @@ func (b *BotService) handleUpdate(ctx context.Context, update tgbotapi.Update) {
 		}
 		callback := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
 		b.bot.Request(callback)
-		go b.handleCallback(ctx, update.CallbackQuery)
+		chatID := int64(0)
+		if update.CallbackQuery.Message != nil {
+			chatID = update.CallbackQuery.Message.Chat.ID
+		}
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("dispatcher panic", "panic", r, "chat_id", chatID)
+				}
+			}()
+			b.handleCallback(ctx, update.CallbackQuery)
+		}()
 		return
 	}
 
@@ -303,48 +379,70 @@ func (b *BotService) handleUpdate(ctx context.Context, update tgbotapi.Update) {
 			return
 		}
 
-		b.mu.RLock()
-		editing := b.editingField
-		dateWait := b.waitingForDate
-		phoneWait := b.waitingForPhone
-		currentState := b.state
-		stateAccID := b.stateAccountID
-		otpWaiterCount := len(b.otpWaiters)
-		b.mu.RUnlock()
-
 		go func() {
+			chatID := update.Message.Chat.ID
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("dispatcher panic", "panic", r, "chat_id", chatID)
+				}
+			}()
+
+			b.mu.Lock()
+			phoneWait := b.waitingForPhone
+			b.waitingForPhone = false
+			phoneInputChat := b.phoneInputChat
+			b.phoneInputChat = 0
+			editing := b.editingField
+			b.editingField = ""
+			dateWait := b.waitingForDate
+			b.waitingForDate = false
+			pendingDateChat := b.pendingDateChat
+			b.pendingDateChat = 0
+			otpWaiterCount := len(b.otpWaiters)
+			loginPending := ""
+			for id := range b.loginStates {
+				loginPending = id
+				break
+			}
+			b.mu.Unlock()
+
 			switch {
-			case phoneWait || currentState == StatePhoneInput:
-				b.handlePhoneInput(update.Message)
-
-			case dateWait || currentState == StateDateInput:
-				b.handleDateInput(update.Message)
-
+			case update.Message.IsCommand():
+				// Commands win outright. The flag reads above already cleared any
+				// pending input, which is exactly the escape hatch.
+				b.handleCommand(ctx, update.Message)
+			case phoneWait:
+				b.handlePhoneInput(ctx, update.Message, phoneInputChat)
+			case editing != "":
+				b.handleConfigEdit(ctx, update.Message, editing)
+			case dateWait:
+				b.handleDateInput(ctx, update.Message, pendingDateChat)
+			case loginPending != "":
+				// Keyed off a live login, not b.state, so a stray button tap
+				// cannot re-route the OTP the user is about to type.
+				b.handleLoginOTPInput(update.Message, loginPending)
 			case otpWaiterCount > 0:
 				b.handleOTPInput(update.Message)
-
-			case currentState == StateLoginOTP:
-				b.handleLoginOTPInput(update.Message, stateAccID)
-
-			case currentState == StateLoginPHR:
-				b.handleLoginOTPInput(update.Message, stateAccID)
-
-			case editing != "":
-				b.handleConfigEdit(ctx, update.Message)
-
-			case update.Message.IsCommand():
-				b.handleCommand(ctx, update.Message)
+			default:
+				b.send(update.Message.Chat.ID, MsgUnrecognizedInput())
 			}
 		}()
 	}
 }
 
+// mainMenu builds the state-aware keyboard. Every call site used to hardcode
+// the same fixed grid regardless of what the account could actually do.
+func (b *BotService) mainMenu() tgbotapi.InlineKeyboardMarkup {
+	return GetMainMenu(b.config.GetActiveAccount(), len(b.config.AccountList()), b.registry.anyRunning())
+}
+
 func (b *BotService) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 	switch msg.Command() {
 	case "start":
+		b.resetFlow()
 		m := tgbotapi.NewMessage(msg.Chat.ID, b.buildWelcomeMessage())
 		m.ParseMode = tgbotapi.ModeHTML
-		m.ReplyMarkup = GetMainMenu()
+		m.ReplyMarkup = b.mainMenu()
 		b.bot.Send(m)
 
 	case "auth":
@@ -357,7 +455,7 @@ func (b *BotService) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 
 		b.config.SetBroadcastChatID(chatID)
 		if err := b.config.Save(b.config.SavePath); err != nil {
-		b.send(chatID, MsgAuthFailedSave(err.Error()))
+			b.send(chatID, MsgAuthFailedSave(err.Error()))
 			return
 		}
 		b.notifier.UpdateChatID(chatID)
@@ -369,15 +467,26 @@ func (b *BotService) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		if b.registry.anyRunning() {
 			b.registry.stopAll()
 			b.send(msg.Chat.ID, MsgAllStopped())
+		} else {
+			b.send(msg.Chat.ID, MsgNoTasksRunning())
 		}
+
+	case "cancel":
+		b.CancelCurrentFlow(msg.Chat.ID)
+
+	case "status":
+		b.showStatus(msg.Chat.ID)
 
 	case "help":
 		b.sendHTML(msg.Chat.ID, MsgHelp())
+
+	default:
+		b.send(msg.Chat.ID, MsgUnknownCommand(msg.Command()))
 	}
 }
 
 func (b *BotService) buildWelcomeMessage() string {
-	if len(b.config.Accounts) == 0 {
+	if len(b.config.AccountList()) == 0 {
 		return MsgWelcomeNoAccounts()
 	}
 
@@ -386,7 +495,7 @@ func (b *BotService) buildWelcomeMessage() string {
 		return MsgWelcomeNoActive()
 	}
 
-	if acc.AuthToken == "" {
+	if auth, _ := acc.Tokens(); auth == "" {
 		return MsgWelcomeNotLoggedIn(acc.Name)
 	}
 
@@ -409,9 +518,6 @@ func (b *BotService) buildWelcomeMessage() string {
 }
 
 func (b *BotService) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
-	callback := tgbotapi.NewCallback(cb.ID, "")
-	b.bot.Request(callback)
-
 	chatID := cb.Message.Chat.ID
 	data := cb.Data
 
@@ -433,11 +539,12 @@ func (b *BotService) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQu
 			count = acc.SelectedCount()
 		}
 		b.ClearState()
-		b.send(chatID, MsgPatientsSelected(count))
-		m := tgbotapi.NewMessage(chatID, "Main Menu")
+		m := tgbotapi.NewMessage(chatID, MsgPatientsSelected(count))
 		m.ParseMode = tgbotapi.ModeHTML
-		m.ReplyMarkup = GetMainMenu()
-		b.bot.Send(m)
+		m.ReplyMarkup = b.mainMenu()
+		if _, err := b.bot.Send(m); err != nil {
+			slog.Error("send main menu failed", "component", "bot", "error", err)
+		}
 
 	case data == "cmd_run":
 		acc := b.config.GetActiveAccount()
@@ -447,11 +554,63 @@ func (b *BotService) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQu
 		}
 		b.showDatePicker(chatID)
 
+	case data == "cmd_login":
+		acc := b.config.GetActiveAccount()
+		if acc == nil {
+			b.send(chatID, MsgNoActiveAccount())
+			return
+		}
+		safego("cmdLogin", func() {
+			ok := b.triggerLogin(ctx, chatID, acc.ID)
+			b.ClearState()
+			if ok {
+				b.fetchPatients(ctx, chatID)
+			}
+		})
+
+	case data == "cmd_select":
+		acc := b.config.GetActiveAccount()
+		if acc == nil || acc.PatientCount() == 0 {
+			b.send(chatID, MsgNoPatientsLoaded())
+			return
+		}
+		b.SetState(StatePatientSelect, acc.ID)
+		patients, selected := acc.Snapshot()
+		m := tgbotapi.NewMessage(chatID, MsgChoosePatients(acc.SelectedCount(), len(patients)))
+		m.ParseMode = tgbotapi.ModeHTML
+		m.ReplyMarkup = GetPatientSelectionKeyboard(patients, selected)
+		if _, err := b.bot.Send(m); err != nil {
+			slog.Error("send patient selection failed", "component", "bot", "error", err)
+		}
+
 	case data == "cmd_select_all":
 		b.selectAllPatients(chatID, cb.Message.MessageID)
 
 	case data == "cmd_clear_sel":
 		b.clearAllSelections(chatID, cb.Message.MessageID)
+
+	case strings.HasPrefix(data, "phr_"):
+		idx, err := strconv.Atoi(strings.TrimPrefix(data, "phr_"))
+		if err != nil {
+			return
+		}
+		b.mu.RLock()
+		var phrCh chan string
+		for _, ls := range b.loginStates {
+			if ls.phase == "phr" {
+				phrCh = ls.phrCh
+				break
+			}
+		}
+		b.mu.RUnlock()
+		if phrCh == nil {
+			b.send(chatID, MsgChooseProfileExpired())
+			return
+		}
+		select {
+		case phrCh <- strconv.Itoa(idx + 1): // performLogin parses a 1-based index
+		default:
+		}
 
 	case strings.HasPrefix(data, "date_"):
 		b.handleDateSelection(ctx, chatID, data)
@@ -467,7 +626,7 @@ func (b *BotService) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQu
 	case data == "cmd_start":
 		m := tgbotapi.NewMessage(chatID, b.buildWelcomeMessage())
 		m.ParseMode = tgbotapi.ModeHTML
-		m.ReplyMarkup = GetMainMenu()
+		m.ReplyMarkup = b.mainMenu()
 		b.bot.Send(m)
 
 	case data == "cmd_cancel":
@@ -536,13 +695,11 @@ func (b *BotService) startAddAccount(chatID int64) {
 	b.bot.Send(m)
 }
 
-func (b *BotService) handlePhoneInput(msg *tgbotapi.Message) {
-	b.mu.Lock()
-	b.waitingForPhone = false
-	chatID := b.phoneInputChat
-	b.phoneInputChat = 0
-	b.mu.Unlock()
-
+func (b *BotService) handlePhoneInput(ctx context.Context, msg *tgbotapi.Message, chatID int64) {
+	if msg.IsCommand() {
+		b.handleCommand(ctx, msg)
+		return
+	}
 	if chatID == 0 {
 		chatID = msg.Chat.ID
 	}
@@ -557,6 +714,24 @@ func (b *BotService) handlePhoneInput(msg *tgbotapi.Message) {
 		return
 	}
 
+	if b.config.HasAccount(phone) {
+		// Re-adding a known phone used to replace the account wholesale,
+		// silently wiping its patients, selections and target date.
+		b.config.SetActiveAccount(phone)
+		if err := b.config.Save(b.config.SavePath); err != nil {
+			slog.Error("save active account failed", "component", "bot", "error", err)
+		}
+		b.send(chatID, MsgAccountExistsReLogin(phone))
+		safego("reLogin", func() {
+			ok := b.triggerLogin(ctx, chatID, phone)
+			b.ClearState()
+			if ok {
+				b.fetchPatients(ctx, chatID)
+			}
+		})
+		return
+	}
+
 	acc := config.NewAccount(phone)
 	b.config.AddAccount(acc)
 	b.config.SetActiveAccount(phone)
@@ -568,15 +743,15 @@ func (b *BotService) handlePhoneInput(msg *tgbotapi.Message) {
 
 	b.SetState(StateLoginOTP, phone)
 	b.send(chatID, MsgAccountAdded(phone))
-	go func() {
+	// fetchPatients runs itself right after, so telling the user to tap a
+	// fetch button here was both redundant and named a button that is gone.
+	safego("addAccountLogin", func() {
+		defer b.ClearState()
 		if b.triggerLogin(context.Background(), chatID, phone) {
 			b.ClearState()
-			b.send(chatID, MsgLoginCompleteFetchPatients())
 			b.fetchPatients(context.Background(), chatID)
-		} else {
-			b.ClearState()
 		}
-	}()
+	})
 }
 
 func (b *BotService) switchAccount(chatID int64, accID string) {
@@ -591,7 +766,7 @@ func (b *BotService) switchAccount(chatID int64, accID string) {
 
 	m := tgbotapi.NewMessage(chatID, b.buildWelcomeMessage())
 	m.ParseMode = tgbotapi.ModeHTML
-	m.ReplyMarkup = GetMainMenu()
+	m.ReplyMarkup = b.mainMenu()
 	b.bot.Send(m)
 }
 
@@ -649,60 +824,52 @@ func (b *BotService) showStatus(chatID int64) {
 	b.sendHTML(chatID, strings.Join(lines, "\n\n"))
 }
 
+// editableFields is the server-side allowlist. Removing a button from
+// GetSettingsMenu is not enough: handleCallback dispatches on an "edit_"
+// prefix, so an old keyboard in chat history can still post any field name.
+var editableFields = map[string]bool{
+	"hip_id":            true,
+	"broadcast_chat_id": true,
+}
+
 func (b *BotService) showFieldEditor(chatID int64, field string) {
+	if !editableFields[field] {
+		b.send(chatID, MsgFieldNotEditable(field))
+		return
+	}
+
 	var currentVal string
 	switch field {
 	case "hip_id":
-		currentVal = b.config.HipID
-	case "bot_token":
-		currentVal = b.config.TelegramBotToken
-	case "owner_id":
-		currentVal = fmt.Sprintf("%d", b.config.OwnerID)
+		currentVal = b.config.GetHipID()
 	case "broadcast_chat_id":
-		currentVal = fmt.Sprintf("%d", b.config.BroadcastChatID)
-	}
-
-	if len(currentVal) > 20 {
-		currentVal = currentVal[:20] + "..."
+		currentVal = fmt.Sprintf("%d", b.config.GetBroadcastChatID())
 	}
 
 	msg := tgbotapi.NewMessage(chatID, MsgFieldEditor(field, currentVal))
 	msg.ParseMode = tgbotapi.ModeHTML
 	msg.ReplyMarkup = GetFieldEditMenu(field)
-	b.bot.Send(msg)
+	if _, err := b.bot.Send(msg); err != nil {
+		slog.Error("send field editor failed", "component", "bot", "error", err)
+	}
 }
 
-func (b *BotService) handleConfigEdit(ctx context.Context, msg *tgbotapi.Message) {
-	b.mu.Lock()
-	field := b.editingField
-	b.editingField = ""
-	b.mu.Unlock()
-
-	if field == "" {
+func (b *BotService) handleConfigEdit(ctx context.Context, msg *tgbotapi.Message, field string) {
+	// Without this a mistyped /start became the new config value. Writing a
+	// command into bot_token bricked the bot in a way a restart could not fix.
+	if msg.IsCommand() {
+		b.handleCommand(ctx, msg)
+		return
+	}
+	if !editableFields[field] {
+		b.send(msg.Chat.ID, MsgFieldNotEditable(field))
 		return
 	}
 
 	newVal := strings.TrimSpace(msg.Text)
-
-	switch field {
-	case "hip_id":
-		b.config.HipID = newVal
-	case "bot_token":
-		b.config.TelegramBotToken = newVal
-	case "owner_id":
-		if id, err := strconv.ParseInt(newVal, 10, 64); err == nil {
-			b.config.OwnerID = id
-		} else {
-			b.send(msg.Chat.ID, MsgInvalidOwnerID())
-			return
-		}
-	case "broadcast_chat_id":
-		if id, err := strconv.ParseInt(newVal, 10, 64); err == nil {
-			b.config.BroadcastChatID = id
-		} else {
-			b.send(msg.Chat.ID, MsgInvalidBroadcastID())
-			return
-		}
+	if err := b.config.SetField(field, newVal); err != nil {
+		b.send(msg.Chat.ID, MsgInvalidFieldValue(field, err.Error()))
+		return
 	}
 
 	if err := b.config.Save(b.config.SavePath); err != nil {
@@ -711,10 +878,18 @@ func (b *BotService) handleConfigEdit(ctx context.Context, msg *tgbotapi.Message
 		b.send(msg.Chat.ID, MsgConfigSaved())
 	}
 
+	// Keep the live notifier in step, or the new value silently does nothing
+	// until the next restart.
+	if field == "broadcast_chat_id" {
+		b.notifier.UpdateChatID(b.config.GetBroadcastChatID())
+	}
+
 	m := tgbotapi.NewMessage(msg.Chat.ID, MsgSettingsMenu())
 	m.ParseMode = tgbotapi.ModeHTML
 	m.ReplyMarkup = GetSettingsMenu()
-	b.bot.Send(m)
+	if _, err := b.bot.Send(m); err != nil {
+		slog.Error("send settings menu failed", "component", "bot", "error", err)
+	}
 }
 
 func (b *BotService) fetchPatients(ctx context.Context, chatID int64) {
@@ -727,91 +902,74 @@ func (b *BotService) fetchPatients(ctx context.Context, chatID int64) {
 	b.SetState(StateFetching, acc.ID)
 	b.send(chatID, MsgFetchingPatients())
 
-	slog.Info("FETCH_DEBUG: spawning goroutine", "account_id", acc.ID)
 	go func() {
-		slog.Info("FETCH_DEBUG: goroutine entered", "account_id", acc.ID)
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("fetch patients panic recovered", "component", "bot", "account_id", acc.ID, "panic", r)
+				slog.Error("fetch patients panic recovered", "component", "bot", "account_key", accountKey(acc.ID), "panic", r)
 				b.send(chatID, MsgFetchInternalError())
 			}
 			b.ClearState()
 		}()
 
-		fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
+		// A FRESH deadline per attempt. The old code opened one 30s context
+		// before the login and reused it after, so by the time the user had read
+		// the SMS and typed the OTP it had long expired -- a fully successful
+		// login still reported "session still invalid".
+		initOnce := func() (*abdm.ABDMManager, context.CancelFunc, error) {
+			netCtx, cancelNet := context.WithTimeout(ctx, fetchNetworkTimeout)
+			manager := abdm.NewABDMManager(acc.CloneForABDM(b.config), netCtx)
+			if err := manager.InitializeSystem(); err != nil {
+				cancelNet()
+				return nil, nil, err
+			}
+			return manager, cancelNet, nil
+		}
 
-		slog.Info("fetch patients: context created", "component", "bot", "account_id", acc.ID)
-
-		cfg := acc.CloneForABDM(b.config)
-		slog.Info("fetch patients: config cloned", "component", "bot", "account_id", acc.ID)
-
-		manager := abdm.NewABDMManager(cfg, fetchCtx)
-		slog.Info("fetch patients: manager created", "component", "bot", "account_id", acc.ID)
-
-		slog.Info("fetch patients: initializing system", "component", "bot", "account_id", acc.ID)
-		if err := manager.InitializeSystem(); err != nil {
-			slog.Warn("fetch patients: token refresh failed, attempting login", "component", "bot", "account_id", acc.ID, "error", err)
+		manager, cancelNet, err := initOnce()
+		if err != nil {
+			slog.Warn("fetch patients: token refresh failed, attempting login", "component", "bot", "account_key", accountKey(acc.ID), "error", err)
 			b.send(chatID, MsgSessionExpired())
 
-			loginCtx, loginCancel := context.WithTimeout(ctx, 8*time.Minute)
-			defer loginCancel()
-
-			if !b.triggerLogin(loginCtx, chatID, acc.ID) {
-				slog.Warn("fetch patients: login failed or cancelled", "component", "bot", "account_id", acc.ID)
+			if !b.triggerLogin(ctx, chatID, acc.ID) {
+				slog.Warn("fetch patients: login failed or cancelled", "component", "bot", "account_key", accountKey(acc.ID))
 				b.send(chatID, MsgLoginFailedManual())
 				return
 			}
 
-			cfg = acc.CloneForABDM(b.config)
-			manager = abdm.NewABDMManager(cfg, fetchCtx)
-			if err := manager.InitializeSystem(); err != nil {
-				slog.Error("fetch patients: init failed after login", "component", "bot", "account_id", acc.ID, "error", err)
+			manager, cancelNet, err = initOnce()
+			if err != nil {
+				slog.Error("fetch patients: init failed after login", "component", "bot", "account_key", accountKey(acc.ID), "error", err)
 				b.send(chatID, MsgSessionInvalidAfterLogin())
 				return
 			}
 		}
+		defer cancelNet()
 
-		slog.Info("fetch patients: fetching from API", "component", "bot", "account_id", acc.ID)
 		patients, err := manager.FetchPatients()
 		if err != nil {
-			slog.Error("fetch patients: API call failed", "component", "bot", "account_id", acc.ID, "error", err)
+			slog.Error("fetch patients: API call failed", "component", "bot", "account_key", accountKey(acc.ID), "error", err)
 			b.send(chatID, MsgFetchFailed(err.Error()))
 			return
 		}
 
-		slog.Info("fetch patients: success", "component", "bot", "account_id", acc.ID, "count", len(patients))
-		acc.Patients = toConfigPatients(patients)
-		// Preserve existing selections for patients that still exist after fetch
-		b.preserveSelections(acc)
+		slog.Info("fetch patients: success", "component", "bot", "account_key", accountKey(acc.ID), "count", len(patients))
+		acc.SetPatients(toConfigPatients(patients))
 		if err := b.config.Save(b.config.SavePath); err != nil {
-			slog.Error("fetch patients: save failed", "component", "bot", "account_id", acc.ID, "error", err)
+			slog.Error("fetch patients: save failed", "component", "bot", "account_key", accountKey(acc.ID), "error", err)
 			b.send(chatID, MsgFetchSaveFailed(err.Error()))
 		}
 
 		b.SetState(StatePatientSelect, acc.ID)
-		selectedCount := acc.SelectedCount()
+		snapPatients, snapSelected := acc.Snapshot()
 		// Send text + keyboard as ONE message so order is guaranteed
-		m := tgbotapi.NewMessage(chatID, MsgPatientsFound(acc.PhoneNumber, len(patients), selectedCount, len(patients)))
+		m := tgbotapi.NewMessage(chatID, MsgPatientsFound(len(patients)))
 		m.ParseMode = tgbotapi.ModeHTML
-		m.ReplyMarkup = GetPatientSelectionKeyboard(acc.Patients, acc.SelectedIDs)
+		m.ReplyMarkup = GetPatientSelectionKeyboard(snapPatients, snapSelected)
 		if _, err := b.bot.Send(m); err != nil {
-			slog.Error("fetch patients: failed to send keyboard", "component", "bot", "account_id", acc.ID, "error", err)
+			slog.Error("fetch patients: failed to send keyboard", "component", "bot", "account_key", accountKey(acc.ID), "error", err)
 			b.send(chatID, MsgPatientKeyboardFailed())
 		}
 	}()
-}
-
-func (b *BotService) preserveSelections(acc *config.Account) {
-	existingOIDs := make(map[string]bool, len(acc.Patients))
-	for _, p := range acc.Patients {
-		existingOIDs[p.OID] = true
-	}
-	for oid := range acc.SelectedIDs {
-		if !existingOIDs[oid] {
-			delete(acc.SelectedIDs, oid)
-		}
-	}
 }
 
 func (b *BotService) triggerLogin(ctx context.Context, chatID int64, accountID string) bool {
@@ -821,80 +979,59 @@ func (b *BotService) triggerLogin(ctx context.Context, chatID int64, accountID s
 		b.send(chatID, MsgLoginAlreadyInProgress())
 		return false
 	}
+	loginCtx, cancel := context.WithTimeout(ctx, loginFlowTimeout)
 	b.loginStates[accountID] = &loginState{
-		phase: "otp",
-		otpCh: make(chan string, 1),
-		phrCh: make(chan string, 1),
+		phase:  "otp",
+		otpCh:  make(chan string, 1),
+		phrCh:  make(chan string, 1),
+		cancel: cancel,
 	}
 	b.mu.Unlock()
 	b.SaveState()
 
-	cleanup := func() {
+	defer func() {
+		cancel()
 		b.mu.Lock()
 		delete(b.loginStates, accountID)
 		b.mu.Unlock()
 		b.SaveState()
-	}
-
-	resultCh := make(chan error, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("login goroutine panicked, recovered", "component", "bot", "account_id", accountID, "panic", r)
-				cleanup()
-				select {
-				case resultCh <- fmt.Errorf("internal error: %v", r):
-				default:
-				}
-			}
-		}()
-		err := b.performLogin(ctx, chatID, accountID)
-		cleanup()
-		select {
-		case resultCh <- err:
-		default:
-		}
 	}()
 
-	select {
-	case err := <-resultCh:
-		if err != nil {
-			b.send(chatID, MsgLoginFailed(err.Error()))
-			return false
-		}
+	// Inline, not in a goroutine behind an outer timer. performLogin honours
+	// loginCtx on every wait, so the old wrapper only added a way to abandon a
+	// login that was still running and leave the user typing into nothing.
+	err := b.performLogin(loginCtx, chatID, accountID)
+	if err == nil {
 		return true
-	case <-time.After(7 * time.Minute):
-		cleanup()
-		b.send(chatID, MsgLoginTimedOut())
-		return false
-	case <-b.StateCancelCh():
-		cleanup()
-		b.send(chatID, MsgLoginCancelled())
-		return false
 	}
+	switch {
+	case errors.Is(loginCtx.Err(), context.DeadlineExceeded):
+		b.send(chatID, MsgLoginTimedOut())
+	case errors.Is(loginCtx.Err(), context.Canceled):
+		b.send(chatID, MsgLoginCancelled())
+	default:
+		b.send(chatID, MsgLoginFailed(err.Error()))
+	}
+	return false
 }
 
 func (b *BotService) toggleSelection(chatID int64, idx int, messageID int) {
 	acc := b.config.GetActiveAccount()
-	if acc == nil || idx < 0 || idx >= len(acc.Patients) {
+	if acc == nil {
+		return
+	}
+	patients, _ := acc.Snapshot()
+	if idx < 0 || idx >= len(patients) {
+		// Stale keyboard from before an account switch or a re-fetch.
+		b.send(chatID, MsgStaleKeyboard())
 		return
 	}
 
-	acc.TogglePatientSelection(acc.Patients[idx].OID)
+	acc.TogglePatientSelection(patients[idx].OID)
 	if err := b.config.Save(b.config.SavePath); err != nil {
 		slog.Error("save patient selection failed", "component", "bot", "error", err)
 	}
-
-	patients := make([]config.Patient, len(acc.Patients))
-	copy(patients, acc.Patients)
-	selected := make(map[string]bool, len(acc.SelectedIDs))
-	for k, v := range acc.SelectedIDs {
-		selected[k] = v
-	}
-
-	markup := GetPatientSelectionKeyboard(patients, selected)
-	edit := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, markup)
-	b.bot.Send(edit)
+	b.refreshSelectionKeyboard(chatID, messageID, acc)
 }
 
 func (b *BotService) selectAllPatients(chatID int64, messageID int) {
@@ -902,22 +1039,11 @@ func (b *BotService) selectAllPatients(chatID int64, messageID int) {
 	if acc == nil {
 		return
 	}
-
 	acc.SelectAllPatients()
 	if err := b.config.Save(b.config.SavePath); err != nil {
 		slog.Error("save patient selections failed", "component", "bot", "error", err)
 	}
-
-	patients := make([]config.Patient, len(acc.Patients))
-	copy(patients, acc.Patients)
-	selected := make(map[string]bool, len(acc.SelectedIDs))
-	for k, v := range acc.SelectedIDs {
-		selected[k] = v
-	}
-
-	markup := GetPatientSelectionKeyboard(patients, selected)
-	edit := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, markup)
-	b.bot.Send(edit)
+	b.refreshSelectionKeyboard(chatID, messageID, acc)
 }
 
 func (b *BotService) clearAllSelections(chatID int64, messageID int) {
@@ -925,27 +1051,50 @@ func (b *BotService) clearAllSelections(chatID int64, messageID int) {
 	if acc == nil {
 		return
 	}
-
 	acc.ClearSelections()
 	if err := b.config.Save(b.config.SavePath); err != nil {
 		slog.Error("save cleared selections failed", "component", "bot", "error", err)
 	}
-
-	patients := make([]config.Patient, len(acc.Patients))
-	copy(patients, acc.Patients)
-	selected := make(map[string]bool)
-
-	markup := GetPatientSelectionKeyboard(patients, selected)
-	edit := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, markup)
-	b.bot.Send(edit)
+	b.refreshSelectionKeyboard(chatID, messageID, acc)
 }
 
-func (b *BotService) makeGetOTPCallback(chatID int64, accountID string) func(string) (string, error) {
+func (b *BotService) refreshSelectionKeyboard(chatID int64, messageID int, acc *config.Account) {
+	patients, selected := acc.Snapshot()
+	edit := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, GetPatientSelectionKeyboard(patients, selected))
+	if _, err := b.bot.Send(edit); err != nil {
+		slog.Error("refresh selection keyboard failed", "component", "bot", "error", err)
+	}
+}
+
+// patientNameFor turns an ABHA health id into the name the user picked, so the
+// OTP prompt names a person instead of an opaque identifier.
+func (b *BotService) patientNameFor(accountID, healthID string) string {
+	acc := b.config.GetAccount(accountID)
+	if acc == nil {
+		return healthID
+	}
+	for _, p := range acc.GetSelectedPatients() {
+		for _, hid := range p.HealthIDs {
+			if hid == healthID {
+				return p.FLN
+			}
+		}
+	}
+	return healthID
+}
+
+func (b *BotService) makeGetOTPCallback(ctx context.Context, chatID int64, accountID, label string) func(string) (string, error) {
 	return func(healthID string) (string, error) {
 		// Serialize OTP collection: only one account may request + wait for its
 		// OTP at a time. Otherwise all accounts fire MsgOTPRequired at once and
 		// the multi-OTP format is required, which fails when one phone maps to
 		// several ABHA accounts.
+		// ponytail: single global gate; per-account gates if throughput matters.
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
 		b.otpGate.Lock()
 		defer b.otpGate.Unlock()
 
@@ -961,20 +1110,23 @@ func (b *BotService) makeGetOTPCallback(chatID int64, accountID string) func(str
 			b.mu.Unlock()
 		}()
 
-		b.send(chatID, MsgOTPRequired(accountID, healthID))
+		b.sendWithCancel(chatID, MsgOTPRequired(label, b.patientNameFor(accountID, healthID)))
 
 		select {
 		case otp := <-otpCh:
 			return otp, nil
-		case <-time.After(5 * time.Minute):
+		case <-time.After(otpInputTimeout):
 			return "", fmt.Errorf("OTP timeout")
-		case <-b.StateCancelCh():
+		case <-ctx.Done():
+			// Stop All now actually interrupts a pending OTP prompt. Previously
+			// this watched a channel that was always nil during a run, so the
+			// waiter survived for 5 minutes and ate every typed message.
 			return "", fmt.Errorf("operation cancelled")
 		}
 	}
 }
 
-func (b *BotService) runAllAccounts(chatID int64, targetTime time.Time) {
+func (b *BotService) runAllAccounts(ctx context.Context, chatID int64, targetTime time.Time) {
 	accounts := b.config.AccountList()
 	if len(accounts) == 0 {
 		b.send(chatID, MsgNoAccountsConfigured())
@@ -992,7 +1144,7 @@ func (b *BotService) runAllAccounts(chatID int64, targetTime time.Time) {
 		return
 	}
 
-	loc, _ := time.LoadLocation("Asia/Kolkata")
+	loc := istLoc
 	hour, min, sec := 6, 0, 0
 	if targetTime.Hour() != 0 || targetTime.Minute() != 0 {
 		hour, min, sec = targetTime.Hour(), targetTime.Minute(), targetTime.Second()
@@ -1002,36 +1154,61 @@ func (b *BotService) runAllAccounts(chatID int64, targetTime time.Time) {
 		hour, min, sec, 0, loc,
 	)
 
-	b.send(chatID, MsgExecutionStart(len(eligible), target.Format("15:04"), target.Format("02 Jan 2006")))
+	totalPatients := 0
+	for _, acc := range eligible {
+		totalPatients += acc.SelectedCount()
+	}
+	b.broadcast(ctx, chatID, MsgExecutionStart(totalPatients, len(eligible), target.Format("15:04"), target.Format("02 Jan 2006")))
 
 	for _, acc := range eligible {
-		go b.runAccount(chatID, acc, target)
+		label := ""
+		if len(eligible) > 1 {
+			label = acc.Name
+		}
+		safego("runAccount", func() { b.runAccount(ctx, chatID, acc, target, label) })
 	}
 }
 
-func (b *BotService) runAccount(chatID int64, acc *config.Account, target time.Time) {
-	runner := newAccountRunner(acc.ID, acc.Name, acc.GetSelectedPatients())
+// label prefixes this run's messages. It is empty for a single-account run,
+// where "[9471392919] " on every line is noise.
+func (b *BotService) runAccount(ctx context.Context, chatID int64, acc *config.Account, target time.Time, label string) {
+	// Every booking path (date picker, custom date, auto-resume) lands here. A
+	// target already in the past otherwise reaches ExecuteTask's
+	// "target passed, burst immediately" branch and fires a live booking run now.
+	if !target.After(time.Now()) {
+		slog.Warn("refusing booking with past target", "component", "bot",
+			"account_key", accountKey(acc.ID), "target", target)
+		b.send(chatID, MsgTargetInPast(target))
+		return
+	}
+
+	runner := newAccountRunner(acc.ID, acc.Name, acc.GetSelectedPatients(), target)
 	b.registry.add(runner)
-	defer b.registry.remove(acc.ID)
+	b.SaveState() // checkpoint while the run is live, so a crash can resume it
+	defer func() {
+		b.registry.remove(acc.ID)
+		b.SaveState()
+	}()
 
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("runner panicked, recovered", "component", "bot", "account", acc.Name, "panic", r)
-			b.send(chatID, MsgRunnerPanic(acc.Name, r))
+			slog.Error("runner panicked, recovered", "component", "bot",
+				"account_key", accountKey(acc.ID), "panic", r, "stack", string(debug.Stack()))
+			b.broadcast(ctx, chatID, MsgRunnerPanic(label, r))
 		}
 	}()
 
 	cfg := acc.CloneForABDM(b.config)
-	err := runner.start(context.Background(), cfg, target,
-		func(msg string) { b.send(chatID, MsgRunnerProgress(acc.Name, msg)) },
-		b.makeGetOTPCallback(chatID, acc.ID),
-		b.buildStatusHandlerForAccount(context.Background(), chatID, acc.Name),
+	err := runner.start(ctx, cfg, target,
+		func(msg string) { b.broadcast(ctx, chatID, MsgRunnerProgress(label, msg)) },
+		b.makeGetOTPCallback(ctx, chatID, acc.ID, label),
+		b.buildStatusHandlerForAccount(ctx, chatID, label, target),
 	)
 
 	if err != nil {
-		b.send(chatID, MsgTaskFailed(acc.Name, err))
+		b.broadcast(ctx, chatID, MsgTaskFailed(label, err))
 	} else {
-		b.send(chatID, MsgTaskCompleted(acc.Name))
+		b.broadcast(ctx, chatID, MsgTaskCompleted(label))
 	}
 }
 
@@ -1064,7 +1241,7 @@ func (b *BotService) handleOTPInput(msg *tgbotapi.Message) {
 		select {
 		case otpCh <- text:
 		default:
-					b.send(msg.Chat.ID, MsgOTPChannelBusy())
+			b.send(msg.Chat.ID, MsgOTPChannelBusy())
 		}
 		return
 	}
@@ -1081,7 +1258,7 @@ func (b *BotService) handleOTPInput(msg *tgbotapi.Message) {
 				select {
 				case ch <- otp:
 				default:
-			b.send(msg.Chat.ID, MsgOTPChannelBusy())
+					b.send(msg.Chat.ID, MsgOTPChannelBusy())
 				}
 				return
 			}
@@ -1112,14 +1289,13 @@ func (b *BotService) performLogin(ctx context.Context, chatID int64, accountID s
 
 	login := abdm.NewABDMLogin()
 
-	slog.Info("initiating login", "component", "bot", "phone", phone)
-	b.send(chatID, MsgInitiatingLogin(phone))
+	slog.Info("initiating login", "component", "bot", "account_key", accountKey(phone))
 	initResp, err := login.InitLogin(ctx, phone)
 	if err != nil {
-		slog.Error("login init failed", "component", "bot", "phone", phone, "error", err)
+		slog.Error("login init failed", "component", "bot", "account_key", accountKey(phone), "error", err)
 		return fmt.Errorf("login init failed: %v", err)
 	}
-	b.send(chatID, MsgOTPInput(initResp.Hint))
+	b.sendWithCancel(chatID, MsgOTPInput(initResp.Hint))
 
 	b.mu.Lock()
 	if ls, ok := b.loginStates[accountID]; ok {
@@ -1135,34 +1311,41 @@ func (b *BotService) performLogin(ctx context.Context, chatID int64, accountID s
 	}
 	b.mu.RUnlock()
 
-	var otp string
-	select {
-	case otp = <-otpCh:
-	case <-time.After(5 * time.Minute):
-		return fmt.Errorf("OTP input timeout (5 min)")
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-b.StateCancelCh():
-		return fmt.Errorf("login cancelled")
-	}
+	// A single mistyped digit used to abort the login and send the user all the
+	// way back to entering their phone number. Re-prompt instead.
+	var verifyResp *abdm.LoginVerifyResponse
+	for attempt := 1; ; attempt++ {
+		var otp string
+		select {
+		case otp = <-otpCh:
+		case <-time.After(otpInputTimeout):
+			return fmt.Errorf("OTP input timeout (%s)", otpInputTimeout)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 
-	slog.Info("verifying OTP", "component", "bot", "phone", phone)
-	verifyResp, err := login.VerifyOTP(ctx, initResp.TxnID, otp)
-	if err != nil {
-		slog.Error("OTP verification failed", "component", "bot", "phone", phone, "error", err)
-		return fmt.Errorf("OTP verification failed: %v", err)
+		slog.Info("verifying OTP", "component", "bot", "account_key", accountKey(phone), "attempt", attempt)
+		resp, err := login.VerifyOTP(ctx, initResp.TxnID, otp)
+		if err == nil {
+			verifyResp = resp
+			break
+		}
+		slog.Warn("OTP verification rejected", "component", "bot", "account_key", accountKey(phone), "attempt", attempt, "error", err)
+		if attempt >= maxOTPAttempts {
+			return fmt.Errorf("OTP rejected after %d attempts: %v", attempt, err)
+		}
+		b.sendWithCancel(chatID, MsgOTPRetry(maxOTPAttempts-attempt))
 	}
 
 	profiles := verifyResp.ABHAProfiles
-	var selectedPHR string
+	var selectedPHR, selectedName string
 
 	if len(profiles) == 0 {
 		return fmt.Errorf("no ABHA profiles found")
 	}
 
 	if len(profiles) == 1 {
-		selectedPHR = profiles[0].ABHAAddress
-		b.send(chatID, MsgAutoSelectedProfile(profiles[0].Name, selectedPHR))
+		selectedPHR, selectedName = profiles[0].ABHAAddress, profiles[0].Name
 	} else {
 		var lines []string
 		for i, p := range profiles {
@@ -1172,7 +1355,18 @@ func (b *BotService) performLogin(ctx context.Context, chatID int64, accountID s
 			}
 			lines = append(lines, MsgProfileLine(i+1, verified, p.Name, p.ABHAAddress))
 		}
-		b.sendHTML(chatID, MsgMultiProfileSelect(strings.Join(lines, "\n"), len(profiles)))
+		// Buttons, not a typed number: this was the last step in the flow that
+		// still demanded the user type something that was already on screen.
+		labels := make([]string, len(profiles))
+		for i, p := range profiles {
+			labels[i] = p.Name
+		}
+		pm := tgbotapi.NewMessage(chatID, MsgMultiProfileSelect(strings.Join(lines, "\n"), len(profiles)))
+		pm.ParseMode = tgbotapi.ModeHTML
+		pm.ReplyMarkup = GetProfileSelectionKeyboard(labels)
+		if _, err := b.bot.Send(pm); err != nil {
+			slog.Error("send profile keyboard failed", "component", "bot", "error", err)
+		}
 
 		b.mu.Lock()
 		if ls, ok := b.loginStates[accountID]; ok {
@@ -1191,43 +1385,40 @@ func (b *BotService) performLogin(ctx context.Context, chatID int64, accountID s
 		var phrInput string
 		select {
 		case phrInput = <-phrCh:
-		case <-time.After(2 * time.Minute):
+		case <-time.After(phrInputTimeout):
 			return fmt.Errorf("profile selection timeout")
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-b.StateCancelCh():
-			return fmt.Errorf("login cancelled")
 		}
 
 		idx, err := strconv.Atoi(strings.TrimSpace(phrInput))
 		if err != nil || idx < 1 || idx > len(profiles) {
 			return fmt.Errorf("invalid selection: %q", phrInput)
 		}
-		selectedPHR = profiles[idx-1].ABHAAddress
-		b.send(chatID, MsgSelectedProfile(profiles[idx-1].Name, selectedPHR))
+		selectedPHR, selectedName = profiles[idx-1].ABHAAddress, profiles[idx-1].Name
 	}
 
-	slog.Info("selecting PHR", "component", "bot", "phone", phone)
+	slog.Info("selecting PHR", "component", "bot", "account_key", accountKey(phone))
 	phrResp, err := login.SelectPHR(ctx, initResp.TxnID, selectedPHR)
 	if err != nil {
-		slog.Error("PHR selection failed", "component", "bot", "phone", phone, "error", err)
+		slog.Error("PHR selection failed", "component", "bot", "account_key", accountKey(phone), "error", err)
 		return fmt.Errorf("PHR selection failed: %v", err)
 	}
 
-	b.send(chatID, MsgExchangingTokens())
 	sess, refresh, err := login.ExchangeMinToken(ctx, phrResp.EKA.MinToken, phrResp.EKA.OID)
 	if err != nil {
-		slog.Error("token exchange failed", "component", "bot", "phone", phone, "error", err)
+		slog.Error("token exchange failed", "component", "bot", "account_key", accountKey(phone), "error", err)
 		return fmt.Errorf("token exchange failed: %v", err)
 	}
 
-	slog.Info("login tokens obtained, saving config", "component", "bot", "phone", phone)
+	slog.Info("login tokens obtained, saving config", "component", "bot", "account_key", accountKey(phone))
 	acc.UpdateTokens(sess, refresh)
 	if err := b.config.Save(b.config.SavePath); err != nil {
 		b.send(chatID, MsgTokensSaveFailed(err.Error()))
 	} else {
-		expiry := abdm.ParseJWTExpiry(sess)
-		b.send(chatID, MsgLoginSuccess(expiry.Format("02 Jan 2006 15:04:05")))
+		slog.Info("login complete", "component", "bot", "account_key", accountKey(phone),
+			"token_expires", abdm.ParseJWTExpiry(sess).Format(time.RFC3339))
+		b.send(chatID, MsgLoginSuccess(selectedName))
 	}
 
 	return nil
@@ -1280,7 +1471,6 @@ func (b *BotService) showDatePicker(chatID int64) {
 		return
 	}
 	b.SetState(StateDateSelect, acc.ID)
-	b.send(chatID, MsgDateStep())
 	m := tgbotapi.NewMessage(chatID, MsgDateSelectTarget())
 	m.ParseMode = tgbotapi.ModeHTML
 	m.ReplyMarkup = GetDatePickerKeyboard()
@@ -1310,28 +1500,25 @@ func (b *BotService) handleDateSelection(ctx context.Context, chatID int64, data
 		return
 	}
 
-	loc, _ := time.LoadLocation("Asia/Kolkata")
+	loc := istLoc
 	now := time.Now().In(loc)
 	targetDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	targetDate = targetDate.AddDate(0, 0, offset)
 
 	b.ClearState()
 	b.SaveState()
-	b.send(chatID, MsgDateSet(targetDate.Format("02 Jan 2006 (Monday)")))
-	go b.runAllAccounts(chatID, targetDate)
+	safego("runAllAccounts", func() { b.runAllAccounts(ctx, chatID, targetDate) })
 }
 
-func (b *BotService) handleDateInput(msg *tgbotapi.Message) {
+func (b *BotService) handleDateInput(ctx context.Context, msg *tgbotapi.Message, chatID int64) {
 	text := strings.TrimSpace(msg.Text)
 	if strings.HasPrefix(text, "/") {
+		b.mu.Lock()
+		b.waitingForDate = true
+		b.pendingDateChat = chatID
+		b.mu.Unlock()
 		return
 	}
-
-	b.mu.Lock()
-	b.waitingForDate = false
-	chatID := b.pendingDateChat
-	b.pendingDateChat = 0
-	b.mu.Unlock()
 
 	if chatID == 0 {
 		chatID = msg.Chat.ID
@@ -1352,32 +1539,37 @@ func (b *BotService) handleDateInput(msg *tgbotapi.Message) {
 		return
 	}
 
-	loc, _ := time.LoadLocation("Asia/Kolkata")
+	loc := istLoc
 	targetDate := time.Date(parsed.Year(), parsed.Month(), parsed.Day(), 0, 0, 0, 0, loc)
 
 	b.ClearState()
 	b.SaveState()
-	b.send(chatID, MsgDateSet(targetDate.Format("02 Jan 2006 (Monday)")))
-	go b.runAllAccounts(chatID, targetDate)
+	safego("runAllAccounts", func() { b.runAllAccounts(ctx, chatID, targetDate) })
 }
 
 func (b *BotService) buildStatusHandler(ctx context.Context, chatID int64) abdm.StatusCallback {
-	return b.buildStatusHandlerForAccount(ctx, chatID, "")
+	return b.buildStatusHandlerForAccount(ctx, chatID, "", time.Time{})
 }
 
-func (b *BotService) buildStatusHandlerForAccount(ctx context.Context, chatID int64, accountName string) abdm.StatusCallback {
+func (b *BotService) buildStatusHandlerForAccount(ctx context.Context, chatID int64, accountName string, targetTime time.Time) abdm.StatusCallback {
 	prefix := ""
 	if accountName != "" {
 		prefix = fmt.Sprintf("[%s] ", accountName)
 	}
 
+	// targetDateIST is the canonical appointment date for this run; the bot's
+	// spec says "shows on the 13th, gone on the 14th" is the contract.
+	// We capture it via closure so the appointment_confirmed sink can stamp
+	// each Record with the right target_date_ist even though the OnStatus
+	// event payload itself does not carry this field.
+	var targetDateIST string
+	hipID := b.config.HipID
+	if !targetTime.IsZero() {
+		targetDateIST = targetTime.Format("2006-01-02")
+	}
+
 	send := func(text string) {
-		msg := prefix + text
-		if b.notifier.HasChannel() {
-			b.notifyChannel(ctx, msg)
-		} else {
-			b.sendHTML(chatID, msg)
-		}
+		b.broadcast(ctx, chatID, prefix+text)
 	}
 
 	return func(event string, details map[string]interface{}) {
@@ -1423,6 +1615,22 @@ func (b *BotService) buildStatusHandlerForAccount(ctx context.Context, chatID in
 			send(notify.FormatAppointmentSuccess(
 				patient, healthID, tokenNum, hipName, "", "Proceed to counter for OPD slip",
 			))
+			// L3 sink: persist confirmation for the live-appointments page.
+			// health_id is used solely as the dedup primary key and never
+			// leaves the host (see PHI rules in pkg/appointments).
+			if b.appointments != nil && healthID != "" && targetDateIST != "" {
+				if err := b.appointments.Upsert(ctx, appointments.Record{
+					HealthID:       healthID,
+					TargetDateIST:  targetDateIST,
+					HipID:          hipID,
+					PatientName:    patient,
+					HipName:        hipName,
+					TokenNumber:    tokenNum,
+					ConfirmedAtUTC: time.Now().UTC(),
+				}); err != nil {
+					slog.Error("appointments upsert failed", "component", "bot", "error", err)
+				}
+			}
 		case "patient_failed":
 			patient, _ := details["patient"].(string)
 			send(notify.FormatBurstResult(patient, false, ""))

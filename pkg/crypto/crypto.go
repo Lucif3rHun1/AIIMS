@@ -50,10 +50,26 @@ func Encrypt(plaintext string) (string, error) {
 
 	key, err := masterKey()
 	if err != nil {
-		// No master key — return plaintext unchanged (backward compatible)
-		return plaintext, nil
+		if !Enabled() {
+			return plaintext, nil
+		}
+		return "", err
 	}
+	return encryptWithKey(plaintext, key)
+}
 
+func EncryptRequired(plaintext string) (string, error) {
+	key, err := masterKey()
+	if err != nil {
+		return "", err
+	}
+	return encryptWithKey(plaintext, key)
+}
+
+func encryptWithKey(plaintext string, key []byte) (string, error) {
+	if plaintext == "" {
+		return "", nil
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", fmt.Errorf("aes.NewCipher: %v", err)
@@ -69,7 +85,6 @@ func Encrypt(plaintext string) (string, error) {
 		return "", fmt.Errorf("rand.Read: %v", err)
 	}
 
-	// Seal appends ciphertext+tag to nonce
 	ciphertext := aesGCM.Seal(nonce, nonce, []byte(plaintext), nil)
 	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
@@ -84,17 +99,32 @@ func Decrypt(ciphertext string) (string, error) {
 
 	key, err := masterKey()
 	if err != nil {
-		// No master key — return as-is
-		return ciphertext, nil
+		if !Enabled() {
+			return ciphertext, nil
+		}
+		return "", err
 	}
+	return decryptWithKey(ciphertext, key)
+}
 
+func DecryptRequired(ciphertext string) (string, error) {
+	key, err := masterKey()
+	if err != nil {
+		return "", err
+	}
+	return decryptWithKey(ciphertext, key)
+}
+
+func decryptWithKey(ciphertext string, key []byte) (string, error) {
+	if ciphertext == "" {
+		return "", nil
+	}
 	data, err := base64.StdEncoding.DecodeString(ciphertext)
 	if err != nil {
-		// Not base64 — assume plaintext (unencrypted legacy data)
 		return ciphertext, nil
 	}
 
-	if len(data) < nonceSize+16 { // nonce + minimum GCM tag
+	if len(data) < nonceSize+16 {
 		return ciphertext, nil
 	}
 
@@ -113,8 +143,7 @@ func Decrypt(ciphertext string) (string, error) {
 
 	plaintext, err := aesGCM.Open(nil, nonce, ciphertextBytes, nil)
 	if err != nil {
-		// Decryption failed — could be wrong key or unencrypted data
-		return "", fmt.Errorf("decryption failed (wrong key?): %v", err)
+		return "", fmt.Errorf("decrypt failed, %s is wrong or was rotated: %w", EnvMasterKey, err)
 	}
 
 	return string(plaintext), nil

@@ -12,12 +12,9 @@ import (
 	"time"
 
 	"aiims-appointment/pkg/config"
-	"golang.org/x/time/rate"
 )
 
 const (
-	BurstCount            = 10
-	TargetInterval        = 100 * time.Millisecond
 	maxValidationWorkers  = 5
 	maxConcurrentPatients = 10
 
@@ -25,7 +22,9 @@ const (
 	SpamInterval          = 1 * time.Second
 	ConfirmationThreshold = 5
 	MaxRenewalDuration    = 6 * time.Hour
-	MinRenewalDuration    = 4 * time.Hour
+	// ponytail: MinRenewalDuration no longer gates the renewal loop (it stops as soon as
+	// every patient is confirmed). Kept only because manager_test.go asserts it; delete both.
+	MinRenewalDuration = 4 * time.Hour
 )
 
 type ConfirmationTracker struct {
@@ -138,19 +137,11 @@ func NewABDMManager(cfg *config.Config, ctx context.Context) *ABDMManager {
 	}
 }
 
-func (am *ABDMManager) Close() {
-	am.cancel()
-	done := make(chan struct{})
-	go func() {
-		am.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		slog.Warn("timeout waiting for goroutines", "component", "manager")
-	}
-}
+// Close cancels the manager context. am.wg belongs to fireBurst's own round; waiting on
+// it here too trips "WaitGroup misuse" when a renewal round Adds while Close is waiting.
+// ponytail: a burst goroutine parked in handlePersistentResponse's time.Sleep(retryAfter)
+// outlives Close. Make that sleep ctx-aware if shutdown latency ever matters.
+func (am *ABDMManager) Close() { am.cancel() }
 
 func (am *ABDMManager) InitializeSystem() error {
 	slog.Info("initializing system", "component", "manager")
@@ -262,7 +253,7 @@ func (am *ABDMManager) performOTPAuth(token *Token, healthID string) error {
 	initPayload := map[string]string{"auth_method": "MOBILE_OTP", "health_id": healthID}
 	body, status, err := makeHTTPCall(am.ctx, am.httpClient, "POST", "https://ndhm.eka.care/v1/auth/init", initPayload, token)
 	if err != nil || status != 200 {
-		slog.Error("OTP init failed", "component", "manager", "patient", healthID, "status", status, "error", err, "body", truncate(string(body), 200))
+		slog.Error("OTP init failed", "component", "manager", "status", status, "error", err)
 		return fmt.Errorf("OTP init failed (status %d)", status)
 	}
 
@@ -281,13 +272,11 @@ func (am *ABDMManager) performOTPAuth(token *Token, healthID string) error {
 	}
 
 	verifyPayload := map[string]string{"otp": otp, "health_id": healthID, "txn_id": txnID}
-	vBody, vStatus, vErr := makeHTTPCall(am.ctx, am.httpClient, "POST", "https://ndhm.eka.care/v1/auth/verify", verifyPayload, token)
+	_, vStatus, vErr := makeHTTPCall(am.ctx, am.httpClient, "POST", "https://ndhm.eka.care/v1/auth/verify", verifyPayload, token)
 	if vErr != nil || vStatus != 200 {
-		slog.Error("OTP verify failed", "component", "manager", "patient", healthID, "status", vStatus, "error", vErr, "body", truncate(string(vBody), 200))
+		slog.Error("OTP verify failed", "component", "manager", "status", vStatus, "error", vErr)
 		return fmt.Errorf("OTP verify failed (status %d)", vStatus)
 	}
-
-	slog.Debug("OTP verify response", "component", "manager", "patient", healthID, "response", string(vBody))
 
 	return nil
 }
@@ -370,7 +359,15 @@ func (am *ABDMManager) ExecuteTask(targetTime time.Time) error {
 			"ready": preWarmSuccess, "failed": preWarmFailed, "total": len(pool),
 		})
 
-		am.SendMessage(fmt.Sprintf("🔥 Pre-warmed %d/%d patients. Waiting for T-0...", preWarmSuccess, len(pool)))
+		if late := time.Since(targetTime); late > 0 {
+			slog.Warn("pre-warm overran target time", "component", "manager", "late", late, "ready", preWarmSuccess)
+			am.SendMessage(fmt.Sprintf("⚠️ Pre-warm overran T-0 by %v — burst is late", late.Round(time.Second)))
+			am.OnStatus("prewarm_overran", map[string]interface{}{
+				"late": late.String(), "ready": preWarmSuccess,
+			})
+		} else {
+			am.SendMessage(fmt.Sprintf("🔥 Pre-warmed %d/%d patients. Waiting for T-0...", preWarmSuccess, len(pool)))
+		}
 
 		// Phase 3: Wait remaining time until exact target
 		remainingWait := time.Until(targetTime)
@@ -432,7 +429,6 @@ func (am *ABDMManager) ExecuteTaskWithRenewal(targetTime time.Time) error {
 
 	am.OnStatus("renewal_loop_entered", map[string]interface{}{
 		"max_duration": MaxRenewalDuration.String(),
-		"min_duration": MinRenewalDuration.String(),
 	})
 
 	for {
@@ -445,16 +441,14 @@ func (am *ABDMManager) ExecuteTaskWithRenewal(targetTime time.Time) error {
 			return nil
 		}
 
-		if elapsed >= MinRenewalDuration {
-			pool := am.GetValidatedPool()
-			if int(am.successCount.Load()) >= len(pool) {
-				am.SendMessage(fmt.Sprintf("✅ All %d patients confirmed after %v, stopping", am.successCount.Load(), elapsed.Round(time.Minute)))
-				am.OnStatus("renewal_all_confirmed", map[string]interface{}{
-					"elapsed": elapsed.String(),
-					"success": am.successCount.Load(),
-				})
-				return nil
-			}
+		pool := am.GetValidatedPool()
+		if int(am.successCount.Load()) >= len(pool) {
+			am.SendMessage(fmt.Sprintf("✅ All %d patients confirmed after %v, stopping", am.successCount.Load(), elapsed.Round(time.Minute)))
+			am.OnStatus("renewal_all_confirmed", map[string]interface{}{
+				"elapsed": elapsed.String(),
+				"success": am.successCount.Load(),
+			})
+			return nil
 		}
 
 		now := time.Now()
@@ -494,7 +488,7 @@ func (am *ABDMManager) ExecuteTaskWithRenewal(targetTime time.Time) error {
 			continue
 		}
 
-		pool := am.GetValidatedPool()
+		pool = am.GetValidatedPool()
 		cachedTokens := make(map[string]*Token, len(pool))
 		for _, vp := range pool {
 			token, err := am.tokenManager.GetPatientToken(vp.Patient.OID)
@@ -537,11 +531,11 @@ func (am *ABDMManager) persistentSpam(p Patient, token *Token, tracker *Confirma
 	defer ticker.Stop()
 
 	// Fire first request immediately
-	resp, status, httpErr := makeHTTPCall(am.ctx, am.httpClient, "POST", "https://ndhm.eka.care/v2/hip/profile/share", payload, token)
+	resp, status, retryAfter, httpErr := makeHTTPCallWithRetryAfter(am.ctx, am.httpClient, "POST", "https://ndhm.eka.care/v2/hip/profile/share", payload, token)
 	if httpErr != nil {
 		slog.Warn("persistentSpam HTTP error", "component", "manager", "patient", p.FLN, "error", httpErr)
 	} else {
-		tokenNum := am.handlePersistentResponse(status, resp, p, tracker)
+		tokenNum := am.handlePersistentResponse(status, retryAfter, resp, p, tracker)
 		if tracker.IsConfirmed() {
 			return tokenNum, nil
 		}
@@ -556,20 +550,20 @@ func (am *ABDMManager) persistentSpam(p Patient, token *Token, tracker *Confirma
 			return "", am.ctx.Err()
 		case <-deadline:
 			lastToken, confirmCount, totalAttempts, confirmed := tracker.GetStats()
-			slog.Info("persistentSpam deadline reached", "component", "manager", "patient", p.FLN,
-				"confirmed", confirmed, "confirmCount", confirmCount, "totalAttempts", totalAttempts, "lastToken", lastToken)
+			slog.Info("persistentSpam deadline reached", "component", "manager",
+				"confirmed", confirmed, "confirmCount", confirmCount, "totalAttempts", totalAttempts)
 			if confirmed {
 				return lastToken, nil
 			}
 			return "", fmt.Errorf("spam duration expired for %s (confirmed=%v, attempts=%d)", p.FLN, confirmed, totalAttempts)
 		case <-ticker.C:
-			resp, status, httpErr := makeHTTPCall(am.ctx, am.httpClient, "POST", "https://ndhm.eka.care/v2/hip/profile/share", payload, token)
+			resp, status, retryAfter, httpErr := makeHTTPCallWithRetryAfter(am.ctx, am.httpClient, "POST", "https://ndhm.eka.care/v2/hip/profile/share", payload, token)
 			if httpErr != nil {
 				slog.Warn("persistentSpam HTTP error", "component", "manager", "patient", p.FLN, "error", httpErr)
 				continue
 			}
 
-			tokenNum := am.handlePersistentResponse(status, resp, p, tracker)
+			tokenNum := am.handlePersistentResponse(status, retryAfter, resp, p, tracker)
 			if tracker.IsConfirmed() {
 				return tokenNum, nil
 			}
@@ -580,34 +574,35 @@ func (am *ABDMManager) persistentSpam(p Patient, token *Token, tracker *Confirma
 	}
 }
 
-func (am *ABDMManager) handlePersistentResponse(status int, resp []byte, p Patient, tracker *ConfirmationTracker) string {
+func (am *ABDMManager) handlePersistentResponse(status int, retryAfter time.Duration, resp []byte, p Patient, tracker *ConfirmationTracker) string {
 	if status == 200 {
 		tokenNum := extractTokenNumber(resp)
 		if tokenNum == "" {
-			slog.Warn("persistentSpam 200 but no token_number", "component", "manager", "patient", p.FLN)
+			slog.Warn("persistentSpam 200 but no token_number", "component", "manager")
 			am.OnStatus("persistent_no_token", map[string]interface{}{
 				"patient": p.FLN, "response": string(resp),
 			})
 			return ""
 		}
 
-		confirmed := tracker.Record(tokenNum)
-		_, confirmCount, totalAttempts, _ := tracker.GetStats()
-		slog.Info("persistentSpam response", "component", "manager", "patient", p.FLN,
-			"token_number", tokenNum, "confirmCount", confirmCount, "totalAttempts", totalAttempts, "confirmed", confirmed)
+		tracker.Record(tokenNum)
+		slog.Info("appointment_confirmed", "event", "appointment_confirmed")
 		return tokenNum
 	}
 
 	transientStatuses := map[int]bool{429: true, 503: true, 502: true}
 	if transientStatuses[status] {
-		slog.Warn("persistentSpam transient error", "component", "manager", "patient", p.FLN, "status", status)
+		if status == 429 && retryAfter > 0 {
+			time.Sleep(retryAfter)
+		}
+		slog.Warn("persistentSpam transient error", "component", "manager", "status", status)
 		am.OnStatus("persistent_transient", map[string]interface{}{
 			"patient": p.FLN, "status": status,
 		})
 		return ""
 	}
 
-	slog.Warn("persistentSpam non-200 response", "component", "manager", "patient", p.FLN, "status", status)
+	slog.Warn("persistentSpam non-200 response", "component", "manager", "status", status)
 	am.OnStatus("persistent_failed_status", map[string]interface{}{
 		"patient": p.FLN, "status": status, "response": string(resp),
 	})
@@ -666,63 +661,6 @@ func (am *ABDMManager) fireBurst(pool []*ValidatedPatient, cachedTokens map[stri
 	}
 
 	am.wg.Wait()
-}
-
-func (am *ABDMManager) performBurst(p Patient, token *Token) {
-	payload := map[string]interface{}{
-		"hip_id":    am.config.HipID,
-		"hip_code":  am.config.HipID,
-		"health_id": p.PrimaryHealthID(),
-		"location":  map[string]interface{}{},
-	}
-
-	limiter := rate.NewLimiter(rate.Every(TargetInterval), BurstCount)
-	var wg sync.WaitGroup
-	var success atomic.Bool
-
-	for i := 0; i < BurstCount; i++ {
-		if success.Load() {
-			break
-		}
-
-		wg.Add(1)
-		go func(attempt int) {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("performBurst goroutine panicked, recovered", "component", "manager", "patient", p.FLN, "attempt", attempt, "panic", r)
-				}
-			}()
-
-			if err := limiter.Wait(am.ctx); err != nil {
-				return
-			}
-
-			if success.Load() {
-				return
-			}
-
-			resp, status, httpErr := makeHTTPCall(am.ctx, am.httpClient, "POST", "https://ndhm.eka.care/v2/hip/profile/share", payload, token)
-			if httpErr != nil {
-				am.OnStatus("burst_attempt_error", map[string]interface{}{
-					"patient": p.FLN, "attempt": attempt, "error": httpErr.Error(),
-				})
-				return
-			}
-
-			am.handleBurstResponse(status, resp, p, attempt, payload, token, &success)
-		}(i)
-	}
-
-	wg.Wait()
-
-	if !success.Load() {
-		am.failCount.Add(1)
-		am.SendMessage(fmt.Sprintf("❌ FAILED: %s", p.FLN))
-		am.OnStatus("patient_failed", map[string]interface{}{
-			"patient": p.FLN, "error": "all burst attempts exhausted",
-		})
-	}
 }
 
 func (am *ABDMManager) handleBurstResponse(status int, resp []byte, p Patient, attempt int, payload map[string]interface{}, token *Token, success *atomic.Bool) {

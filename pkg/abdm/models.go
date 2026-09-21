@@ -39,9 +39,9 @@ type ValidatedPatient struct {
 }
 
 type ABHAProfile struct {
-	Name         string `json:"name"`
-	ABHAAddress  string `json:"abha_address"`
-	KYCVerified  string `json:"kyc_verified"`
+	Name        string `json:"name"`
+	ABHAAddress string `json:"abha_address"`
+	KYCVerified string `json:"kyc_verified"`
 }
 
 type LoginInitResponse struct {
@@ -50,11 +50,11 @@ type LoginInitResponse struct {
 }
 
 type LoginVerifyResponse struct {
-	TxnID       string        `json:"txn_id"`
-	SkipState   string        `json:"skip_state"`
-	Hint        string        `json:"hint"`
+	TxnID        string        `json:"txn_id"`
+	SkipState    string        `json:"skip_state"`
+	Hint         string        `json:"hint"`
 	ABHAProfiles []ABHAProfile `json:"abha_profiles"`
-	EKA         struct {
+	EKA          struct {
 		MinToken string `json:"min_token"`
 	} `json:"eka"`
 }

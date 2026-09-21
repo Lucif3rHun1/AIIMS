@@ -74,7 +74,8 @@ func (b *BotService) SaveState() error {
 			snap.RunningTasks = append(snap.RunningTasks, RunningTask{
 				AccountID:   r.accountID,
 				AccountName: r.accountName,
-				StartedAt:   time.Now(), // We don't track exact start time, use current
+				TargetTime:  r.target,
+				StartedAt:   r.startedAt,
 			})
 		}
 	}
@@ -153,28 +154,34 @@ func (b *BotService) AutoResume(ctx context.Context, chatID int64) {
 		return // No saved state
 	}
 
-	slog.Info("auto-resuming from saved state", "component", "state", "state", snap.CurrentState, "account_id", snap.StateAccountID)
+	slog.Info("auto-resuming from saved state", "component", "state", "state", snap.CurrentState, "account_key", accountKey(snap.StateAccountID))
 
 	// Resume running tasks
 	if len(snap.RunningTasks) > 0 {
 		b.send(chatID, fmt.Sprintf("🔄 Auto-resuming %d interrupted booking task(s)...", len(snap.RunningTasks)))
 		for _, task := range snap.RunningTasks {
-			acc := b.config.Accounts[task.AccountID]
+			acc := b.config.GetAccount(task.AccountID)
 			if acc == nil {
-				slog.Warn("cannot resume task, account not found", "component", "state", "account_id", task.AccountID)
+				slog.Warn("cannot resume task, account not found", "component", "state", "account_key", accountKey(task.AccountID))
 				continue
 			}
 			if acc.SelectedCount() == 0 {
-				slog.Warn("cannot resume task, no patients selected", "component", "state", "account_id", task.AccountID)
+				slog.Warn("cannot resume task, no patients selected", "component", "state", "account_key", accountKey(task.AccountID))
 				continue
 			}
-			// Resume with today's date at 6 AM if target time passed
-			loc, _ := time.LoadLocation("Asia/Kolkata")
-			target := time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), 6, 0, 0, 0, loc)
-			if task.TargetTime.After(time.Now()) {
-				target = task.TargetTime
+			// Never guess a target. Resuming a tomorrow-06:00 run against a
+			// fabricated today-06:00 burned the session at the wrong date.
+			if !task.TargetTime.After(time.Now()) {
+				slog.Warn("cannot resume task, target time missing or passed", "component", "state",
+					"account_key", accountKey(task.AccountID), "target", task.TargetTime)
+				b.send(chatID, MsgResumeSkipped(acc.Name, task.TargetTime))
+				continue
 			}
-			go b.runAccount(chatID, acc, target)
+			label := ""
+			if len(snap.RunningTasks) > 1 {
+				label = acc.Name
+			}
+			safego("resumeAccount", func() { b.runAccount(ctx, chatID, acc, task.TargetTime, label) })
 		}
 	}
 
@@ -185,7 +192,7 @@ func (b *BotService) AutoResume(ctx context.Context, chatID int64) {
 			lines = append(lines, fmt.Sprintf("• <code>%s</code>", accID))
 		}
 		b.sendHTML(chatID, fmt.Sprintf(
-			"⚠️ <b>Interrupted OTP Flows</b>\n\nThe following accounts were waiting for OTP when the bot stopped:\n\n%s\n\nIf booking is still needed, restart the flow with 🚀 Run.",
+			"⚠️ <b>Interrupted OTP Flows</b>\n\nThe following accounts were waiting for OTP when the bot stopped:\n\n%s\n\nIf booking is still needed, restart it with 📅 Book.",
 			strings.Join(lines, "\n"),
 		))
 	}
@@ -197,7 +204,7 @@ func (b *BotService) AutoResume(ctx context.Context, chatID int64) {
 			lines = append(lines, fmt.Sprintf("• <code>%s</code> (phase: %s)", accID, phase))
 		}
 		b.sendHTML(chatID, fmt.Sprintf(
-			"⚠️ <b>Interrupted Login Flows</b>\n\nThe following accounts were in login when the bot stopped:\n\n%s\n\nPlease re-authenticate using 👤 Accounts → ➕ Add Account.",
+			"⚠️ <b>Interrupted Login Flows</b>\n\nThe following accounts were in login when the bot stopped:\n\n%s\n\nTap 🔐 Log in to re-authenticate.",
 			strings.Join(lines, "\n"),
 		))
 	}

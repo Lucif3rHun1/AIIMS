@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"aiims-appointment/pkg/abdm"
 	"aiims-appointment/pkg/config"
 )
+
+func accountKey(phone string) string { return config.AccountKey(phone) }
 
 // TokenRefresher manages proactive token refresh for all accounts.
 // It runs as a background goroutine, periodically checking token expiry
@@ -17,7 +20,7 @@ type TokenRefresher struct {
 	config   *config.Config
 	interval time.Duration
 	stopCh   chan struct{}
-	running  bool
+	running  atomic.Bool
 }
 
 // NewTokenRefresher creates a new token refresher.
@@ -32,20 +35,20 @@ func NewTokenRefresher(cfg *config.Config) *TokenRefresher {
 
 // Start begins the background token refresh loop.
 func (tr *TokenRefresher) Start() {
-	if tr.running {
+	if !tr.running.CompareAndSwap(false, true) {
 		return
 	}
-	tr.running = true
 	go tr.loop()
 	slog.Info("token refresher started", "component", "refresher", "interval", tr.interval)
 }
 
 // Stop halts the background token refresh loop.
 func (tr *TokenRefresher) Stop() {
-	if !tr.running {
+	// CompareAndSwap, not a plain bool: two Stop() calls used to close stopCh
+	// twice, and a double close panics.
+	if !tr.running.CompareAndSwap(true, false) {
 		return
 	}
-	tr.running = false
 	close(tr.stopCh)
 	slog.Info("token refresher stopped", "component", "refresher")
 }
@@ -66,6 +69,11 @@ func (tr *TokenRefresher) RefreshAll() RefreshSummary {
 		// Check token expiry
 		expiry := abdm.ParseJWTExpiry(acc.AuthToken)
 		if expiry.IsZero() {
+			// Unparseable token. The usual cause is a wrong or rotated
+			// AIIMS_MASTER_KEY leaving ciphertext in the field, which silently
+			// stops every refresh for this account until someone notices.
+			slog.Warn("token expiry unreadable, skipping refresh",
+				"component", "refresher", "account_key", accountKey(acc.PhoneNumber))
 			summary.Skipped++
 			continue
 		}
@@ -78,14 +86,15 @@ func (tr *TokenRefresher) RefreshAll() RefreshSummary {
 		}
 
 		// Token needs refresh
-		slog.Info("proactive token refresh", "component", "refresher", "account_id", acc.ID, "expires_in", time.Until(expiry).Round(time.Second))
+		key := accountKey(acc.PhoneNumber)
+		slog.Info("proactive token refresh", "component", "refresher", "account_key", key, "expires_in", time.Until(expiry).Round(time.Second))
 		if err := tr.refreshAccount(acc); err != nil {
 			summary.Failed++
-			summary.Errors = append(summary.Errors, fmt.Sprintf("%s: %v", acc.ID, err))
-			slog.Error("proactive refresh failed", "component", "refresher", "account_id", acc.ID, "error", err)
+			summary.Errors = append(summary.Errors, fmt.Sprintf("%s: %v", key, err))
+			slog.Error("proactive refresh failed", "component", "refresher", "account_key", key, "error", err)
 		} else {
 			summary.Refreshed++
-			slog.Info("proactive refresh succeeded", "component", "refresher", "account_id", acc.ID)
+			slog.Info("proactive refresh succeeded", "component", "refresher", "account_key", key)
 		}
 	}
 
@@ -96,7 +105,7 @@ func (tr *TokenRefresher) RefreshAll() RefreshSummary {
 func (tr *TokenRefresher) refreshAccount(acc *config.Account) error {
 	// Create a temporary manager just for token refresh
 	cfg := acc.CloneForABDM(tr.config)
-	
+
 	// Create HTTP client and token manager
 	httpClient := abdm.NewHTTPClient()
 	deviceID, _ := abdm.GenerateSecureUUID()
@@ -109,7 +118,7 @@ func (tr *TokenRefresher) refreshAccount(acc *config.Account) error {
 	}
 
 	tm := abdm.NewTokenManager(cfg, httpClient, masterToken, context.Background())
-	
+
 	if err := tm.RefreshMasterToken(); err != nil {
 		return fmt.Errorf("refresh failed: %w", err)
 	}
@@ -124,10 +133,10 @@ func (tr *TokenRefresher) loop() {
 	// Do an immediate refresh on startup
 	summary := tr.RefreshAll()
 	if summary.Total() > 0 {
-		slog.Info("initial refresh complete", "component", "refresher", 
-			"refreshed", summary.Refreshed, 
-			"failed", summary.Failed, 
-			"healthy", summary.Healthy, 
+		slog.Info("initial refresh complete", "component", "refresher",
+			"refreshed", summary.Refreshed,
+			"failed", summary.Failed,
+			"healthy", summary.Healthy,
 			"skipped", summary.Skipped)
 	}
 
