@@ -1173,9 +1173,10 @@ func (b *BotService) runAllAccounts(ctx context.Context, chatID int64, targetTim
 // where "[9471392919] " on every line is noise.
 func (b *BotService) runAccount(ctx context.Context, chatID int64, acc *config.Account, target time.Time, label string) {
 	// Every booking path (date picker, custom date, auto-resume) lands here. A
-	// target already in the past otherwise reaches ExecuteTask's
-	// "target passed, burst immediately" branch and fires a live booking run now.
-	if !target.After(time.Now()) {
+	// target between 06:00 and 12:00 IST reaches ExecuteTask's "target passed,
+	// burst immediately" branch, which is what we want; after 12:00 the day's
+	// booking has closed.
+	if bookingClosed(target, time.Now()) {
 		slog.Warn("refusing booking with past target", "component", "bot",
 			"account_key", accountKey(acc.ID), "target", target)
 		b.send(chatID, MsgTargetInPast(target))

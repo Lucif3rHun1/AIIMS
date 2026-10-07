@@ -73,7 +73,7 @@ func MsgHelp() string {
 		"<b>Quick start</b> — the menu always shows your next step:\n" +
 		"• ➕ Add account → enter phone → enter the OTP you receive\n" +
 		"• 🔄 Load patients → 👥 Choose patients → 💾 Save\n" +
-		"• 📅 Book → pick a date → the bot books at 06:00 AM IST\n\n" +
+		"• 📅 Book → pick a date → the bot books at 06:00 AM IST (today works until 12:00 PM, booked immediately)\n\n" +
 		"<b>Tips:</b>\n" +
 		"• Add multiple accounts and book them all at once\n" +
 		"• Send /cancel at any point to get unstuck\n" +
@@ -420,8 +420,8 @@ func MsgStaleKeyboard() string {
 
 // MsgTargetInPast refuses a booking whose slot has already passed.
 func MsgTargetInPast(t time.Time) string {
-	return fmt.Sprintf("⏰ <b>%s has already passed.</b>\n\nBooking was not started — it would fire immediately instead of waiting for the slot.\n\nPick a later date.",
-		html.EscapeString(t.Format("02 Jan 2006, 15:04")))
+	return fmt.Sprintf("⏰ <b>Booking for %s has closed.</b>\n\nTokens can be booked until 12:00 PM IST that day.\n\nPick a later date.",
+		html.EscapeString(t.Format("02 Jan 2006")))
 }
 
 // MsgOTPRetry re-prompts after a rejected OTP instead of killing the login.

@@ -115,16 +115,25 @@ func GetPatientSelectionKeyboard(patients []config.Patient, selected map[string]
 	return tgbotapi.InlineKeyboardMarkup{InlineKeyboard: rows}
 }
 
+// bookingCloseHour is when the day's token booking closes (IST). Bookings fire
+// at 06:00; picking the day between 06:00 and 12:00 bursts immediately.
+const bookingCloseHour = 12
+
+// bookingClosed reports whether day's booking window has closed as of now.
+func bookingClosed(day, now time.Time) bool {
+	d := day.In(istLoc)
+	return !now.Before(time.Date(d.Year(), d.Month(), d.Day(), bookingCloseHour, 0, 0, 0, istLoc))
+}
+
 func GetDatePickerKeyboard() tgbotapi.InlineKeyboardMarkup {
 	loc := istLoc
 	now := time.Now().In(loc)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 
-	// Bookings always fire at 06:00 IST. Once that has passed, "Today" is a slot
-	// in the past: runAccount refuses it, so offering it is a button that only
-	// ever produces an error.
+	// Token booking stays open until 12:00 IST; after that runAccount refuses
+	// "Today", so offering it is a button that only ever produces an error.
 	start := 0
-	if now.After(today.Add(6 * time.Hour)) {
+	if bookingClosed(today, now) {
 		start = 1
 	}
 
