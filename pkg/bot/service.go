@@ -1154,11 +1154,20 @@ func (b *BotService) runAllAccounts(ctx context.Context, chatID int64, targetTim
 		hour, min, sec, 0, loc,
 	)
 
+	if bookingClosed(target, time.Now()) {
+		b.send(chatID, MsgTargetInPast(target))
+		return
+	}
+
 	totalPatients := 0
 	for _, acc := range eligible {
 		totalPatients += acc.SelectedCount()
 	}
-	b.broadcast(ctx, chatID, MsgExecutionStart(totalPatients, len(eligible), target.Format("15:04"), target.Format("02 Jan 2006")))
+	timeStr := target.Format("15:04") + " IST"
+	if !target.After(time.Now()) {
+		timeStr = "window open, starting now" // "Today" after 06:00: every account bursts immediately
+	}
+	b.broadcast(ctx, chatID, MsgExecutionStart(totalPatients, len(eligible), timeStr, target.Format("02 Jan 2006")))
 
 	for _, acc := range eligible {
 		label := ""

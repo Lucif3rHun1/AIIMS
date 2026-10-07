@@ -292,124 +292,116 @@ func (am *ABDMManager) ExecuteTask(targetTime time.Time) error {
 
 	const preWarmOffset = 30 * time.Second
 
+	// A late run can finish OTP/validation after the window closed.
+	if !time.Now().Before(bookingClose(targetTime)) {
+		return fmt.Errorf("booking window closed at %s", bookingClose(targetTime).Format("15:04"))
+	}
+
+	// One path whether the target is ahead or already passed (e.g. "Today"
+	// picked after 06:00): the waits below simply return at once when late,
+	// so a late run still pre-warms, honours cancel and bursts identically.
 	wait := time.Until(targetTime)
-	if wait > 0 {
+	late := wait <= 0
+	if late {
+		slog.Warn("target time passed, bursting immediately", "component", "manager")
+		am.SendMessage("⚡ Booking window already open — starting now")
+	} else {
 		am.SendMessage(fmt.Sprintf("⏳ Waiting %v until target time...", wait.Round(time.Minute)))
 		am.OnStatus("waiting", map[string]interface{}{
 			"wait_seconds": wait.Seconds(), "target": targetTime.Format("15:04:05"),
 		})
-
-		preWarmTime := targetTime.Add(-preWarmOffset)
-		preWarmWait := time.Until(preWarmTime)
-
-		if preWarmWait > 0 {
-			preWarmTimer := time.NewTimer(preWarmWait)
-			select {
-			case <-preWarmTimer.C:
-			case <-am.ctx.Done():
-				preWarmTimer.Stop()
-				return am.ctx.Err()
-			}
-		}
-
-		// Phase 2: Pre-warm — refresh master token + pre-switch all patient tokens
-		am.OnStatus("prewarm_started", map[string]interface{}{
-			"total_patients": len(pool),
-			"t_minus":        preWarmOffset.String(),
-		})
-
-		slog.Info("pre-warm: refreshing master token", "component", "manager")
-		if err := am.tokenManager.RefreshMasterToken(); err != nil {
-			return fmt.Errorf("pre-warm master token refresh failed: %v", err)
-		}
-		slog.Info("pre-warm: master token refreshed", "component", "manager")
-
-		am.OnStatus("prewarm_token_refreshed", map[string]interface{}{
-			"total_patients": len(pool),
-		})
-
-		cachedTokens := make(map[string]*Token, len(pool))
-		preWarmSuccess := 0
-		preWarmFailed := 0
-
-		for _, vp := range pool {
-			select {
-			case <-am.ctx.Done():
-				return am.ctx.Err()
-			default:
-			}
-
-			token, err := am.tokenManager.GetPatientToken(vp.Patient.OID)
-			if err != nil {
-				slog.Error("pre-warm token switch failed", "component", "manager", "patient", vp.Patient.FLN, "error", err)
-				preWarmFailed++
-				continue
-			}
-			cachedTokens[vp.Patient.OID] = token
-			preWarmSuccess++
-
-			am.OnStatus("prewarm_progress", map[string]interface{}{
-				"patient": vp.Patient.FLN,
-				"ready":   preWarmSuccess,
-				"total":   len(pool),
-			})
-		}
-
-		am.OnStatus("prewarm_complete", map[string]interface{}{
-			"ready": preWarmSuccess, "failed": preWarmFailed, "total": len(pool),
-		})
-
-		if late := time.Since(targetTime); late > 0 {
-			slog.Warn("pre-warm overran target time", "component", "manager", "late", late, "ready", preWarmSuccess)
-			am.SendMessage(fmt.Sprintf("⚠️ Pre-warm overran T-0 by %v — burst is late", late.Round(time.Second)))
-			am.OnStatus("prewarm_overran", map[string]interface{}{
-				"late": late.String(), "ready": preWarmSuccess,
-			})
-		} else {
-			am.SendMessage(fmt.Sprintf("🔥 Pre-warmed %d/%d patients. Waiting for T-0...", preWarmSuccess, len(pool)))
-		}
-
-		// Phase 3: Wait remaining time until exact target
-		remainingWait := time.Until(targetTime)
-		if remainingWait > 0 {
-			remainingTimer := time.NewTimer(remainingWait)
-			select {
-			case <-remainingTimer.C:
-			case <-am.ctx.Done():
-				remainingTimer.Stop()
-				return am.ctx.Err()
-			}
-		}
-
-		// Phase 4: BURST with pre-cached tokens — no HTTP overhead
-		am.OnStatus("execution_started", map[string]interface{}{
-			"total_patients": len(pool), "target": targetTime.Format("02-01-2006 15:04:05"),
-		})
-
-		am.fireBurst(pool, cachedTokens)
-	} else {
-		// Target already passed — burst immediately with fresh tokens
-		slog.Warn("target time passed, bursting immediately", "component", "manager")
-		if err := am.tokenManager.RefreshMasterToken(); err != nil {
-			return fmt.Errorf("immediate burst token refresh failed: %v", err)
-		}
-
-		am.OnStatus("execution_started", map[string]interface{}{
-			"total_patients": len(pool), "target": targetTime.Format("02-01-2006 15:04:05"),
-		})
-
-		cachedTokens := make(map[string]*Token, len(pool))
-		for _, vp := range pool {
-			token, err := am.tokenManager.GetPatientToken(vp.Patient.OID)
-			if err != nil {
-				slog.Error("token switch failed", "component", "manager", "patient", vp.Patient.FLN, "error", err)
-				continue
-			}
-			cachedTokens[vp.Patient.OID] = token
-		}
-
-		am.fireBurst(pool, cachedTokens)
 	}
+
+	preWarmTime := targetTime.Add(-preWarmOffset)
+	preWarmWait := time.Until(preWarmTime)
+
+	if preWarmWait > 0 {
+		preWarmTimer := time.NewTimer(preWarmWait)
+		select {
+		case <-preWarmTimer.C:
+		case <-am.ctx.Done():
+			preWarmTimer.Stop()
+			return am.ctx.Err()
+		}
+	}
+
+	// Phase 2: Pre-warm — refresh master token + pre-switch all patient tokens
+	am.OnStatus("prewarm_started", map[string]interface{}{
+		"total_patients": len(pool),
+		"t_minus":        preWarmOffset.String(),
+	})
+
+	slog.Info("pre-warm: refreshing master token", "component", "manager")
+	if err := am.tokenManager.RefreshMasterToken(); err != nil {
+		return fmt.Errorf("pre-warm master token refresh failed: %v", err)
+	}
+	slog.Info("pre-warm: master token refreshed", "component", "manager")
+
+	am.OnStatus("prewarm_token_refreshed", map[string]interface{}{
+		"total_patients": len(pool),
+	})
+
+	cachedTokens := make(map[string]*Token, len(pool))
+	preWarmSuccess := 0
+	preWarmFailed := 0
+
+	for _, vp := range pool {
+		select {
+		case <-am.ctx.Done():
+			return am.ctx.Err()
+		default:
+		}
+
+		token, err := am.tokenManager.GetPatientToken(vp.Patient.OID)
+		if err != nil {
+			slog.Error("pre-warm token switch failed", "component", "manager", "patient", vp.Patient.FLN, "error", err)
+			preWarmFailed++
+			continue
+		}
+		cachedTokens[vp.Patient.OID] = token
+		preWarmSuccess++
+
+		am.OnStatus("prewarm_progress", map[string]interface{}{
+			"patient": vp.Patient.FLN,
+			"ready":   preWarmSuccess,
+			"total":   len(pool),
+		})
+	}
+
+	am.OnStatus("prewarm_complete", map[string]interface{}{
+		"ready": preWarmSuccess, "failed": preWarmFailed, "total": len(pool),
+	})
+
+	if overran := time.Since(targetTime); late {
+		am.SendMessage(fmt.Sprintf("🔥 Pre-warmed %d/%d patients. Bursting now...", preWarmSuccess, len(pool)))
+	} else if overran > 0 {
+		slog.Warn("pre-warm overran target time", "component", "manager", "late", overran, "ready", preWarmSuccess)
+		am.SendMessage(fmt.Sprintf("⚠️ Pre-warm overran T-0 by %v — burst is late", overran.Round(time.Second)))
+		am.OnStatus("prewarm_overran", map[string]interface{}{
+			"late": overran.String(), "ready": preWarmSuccess,
+		})
+	} else {
+		am.SendMessage(fmt.Sprintf("🔥 Pre-warmed %d/%d patients. Waiting for T-0...", preWarmSuccess, len(pool)))
+	}
+
+	// Phase 3: Wait remaining time until exact target
+	remainingWait := time.Until(targetTime)
+	if remainingWait > 0 {
+		remainingTimer := time.NewTimer(remainingWait)
+		select {
+		case <-remainingTimer.C:
+		case <-am.ctx.Done():
+			remainingTimer.Stop()
+			return am.ctx.Err()
+		}
+	}
+
+	// Phase 4: BURST with pre-cached tokens — no HTTP overhead
+	am.OnStatus("execution_started", map[string]interface{}{
+		"total_patients": len(pool), "target": targetTime.Format("02-01-2006 15:04:05"),
+	})
+
+	am.fireBurst(pool, cachedTokens)
 
 	success := am.successCount.Load()
 	fail := am.failCount.Load()
@@ -418,6 +410,12 @@ func (am *ABDMManager) ExecuteTask(targetTime time.Time) error {
 	})
 
 	return nil
+}
+
+// bookingClose is when the target day's token booking closes (12:00 in the
+// target's zone, IST for every bot-built target). Mirrors bot.bookingClosed.
+func bookingClose(targetTime time.Time) time.Time {
+	return time.Date(targetTime.Year(), targetTime.Month(), targetTime.Day(), 12, 0, 0, 0, targetTime.Location())
 }
 
 func (am *ABDMManager) ExecuteTaskWithRenewal(targetTime time.Time) error {
@@ -457,6 +455,16 @@ func (am *ABDMManager) ExecuteTaskWithRenewal(targetTime time.Time) error {
 
 		if renewalTime.Before(now.Add(10 * time.Second)) {
 			renewalTime = time.Date(now.Year(), now.Month(), now.Day(), now.Hour()+2, 0, 0, 0, now.Location()).Add(-1 * time.Minute)
+		}
+
+		// Renewing past the 12:00 close only spams a shut window and keeps
+		// the runner registered, blocking the next day's booking.
+		if !renewalTime.Before(bookingClose(targetTime)) {
+			am.SendMessage("⏹ Booking window closes at 12:00, stopping renewals")
+			am.OnStatus("renewal_window_closed", map[string]interface{}{
+				"elapsed": elapsed.String(),
+			})
+			return nil
 		}
 
 		waitDuration := time.Until(renewalTime)

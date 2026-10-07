@@ -67,7 +67,7 @@ func TestTranscript(t *testing.T) {
 	target := time.Date(2026, 9, 22, 6, 0, 0, 0, istLoc)
 	t.Log("===== booking phase copy =====")
 	for _, s := range []string{
-		MsgExecutionStart(1, 1, target.Format("15:04"), target.Format("02 Jan 2006")),
+		MsgExecutionStart(1, 1, target.Format("15:04")+" IST", target.Format("02 Jan 2006")),
 		MsgOTPRequired("", "Jay Shankar"),
 		MsgRunnerProgress("", "⏳ Waiting 3h45m0s until target time..."),
 		MsgTaskCompleted(""),

@@ -316,7 +316,7 @@ func MsgNoPatientsSelectedAny() string {
 }
 
 func MsgExecutionStart(patients, accounts int, timeStr, dateStr string) string {
-	return fmt.Sprintf("🚀 Booking <b>%s</b>%s\n📅 %s at %s IST", plural(patients, "patient"), accountSuffix(accounts), html.EscapeString(dateStr), html.EscapeString(timeStr))
+	return fmt.Sprintf("🚀 Booking <b>%s</b>%s\n📅 %s · %s", plural(patients, "patient"), accountSuffix(accounts), html.EscapeString(dateStr), html.EscapeString(timeStr))
 }
 
 func MsgRunnerPanic(name string, panicVal interface{}) string {
@@ -435,8 +435,8 @@ func MsgResumeSkipped(account string, target time.Time) string {
 		return fmt.Sprintf("⚠️ Could not auto-resume <b>%s</b>: the booking slot was not recorded.\n\nStart it again with 📅 Book.",
 			html.EscapeString(account))
 	}
-	return fmt.Sprintf("⚠️ Could not auto-resume <b>%s</b>: its slot (%s) has already passed.\n\nStart it again with 📅 Book.",
-		html.EscapeString(account), html.EscapeString(target.Format("02 Jan 2006, 15:04")))
+	return fmt.Sprintf("⚠️ Could not auto-resume <b>%s</b>: booking for %s has closed.\n\nStart it again with 📅 Book.",
+		html.EscapeString(account), html.EscapeString(target.Format("02 Jan 2006")))
 }
 
 func MsgUnknownCommand(cmd string) string {

@@ -68,16 +68,16 @@ func (b *BotService) SaveState() error {
 	}
 	b.mu.RUnlock()
 
-	// Capture running tasks from registry
+	// Capture running tasks from registry. Membership is the liveness signal:
+	// runAccount adds before start and removes on exit, and its start-of-run
+	// checkpoint fires before runner.start flips running=true.
 	for _, r := range b.registry.all() {
-		if r.running.Load() {
-			snap.RunningTasks = append(snap.RunningTasks, RunningTask{
-				AccountID:   r.accountID,
-				AccountName: r.accountName,
-				TargetTime:  r.target,
-				StartedAt:   r.startedAt,
-			})
-		}
+		snap.RunningTasks = append(snap.RunningTasks, RunningTask{
+			AccountID:   r.accountID,
+			AccountName: r.accountName,
+			TargetTime:  r.target,
+			StartedAt:   r.startedAt,
+		})
 	}
 
 	data, err := json.MarshalIndent(snap, "", "  ")
@@ -171,7 +171,8 @@ func (b *BotService) AutoResume(ctx context.Context, chatID int64) {
 			}
 			// Never guess a target. Resuming a tomorrow-06:00 run against a
 			// fabricated today-06:00 burned the session at the wrong date.
-			if !task.TargetTime.After(time.Now()) {
+			// A run interrupted between 06:00 and 12:00 resumes and bursts now.
+			if task.TargetTime.IsZero() || bookingClosed(task.TargetTime, time.Now()) {
 				slog.Warn("cannot resume task, target time missing or passed", "component", "state",
 					"account_key", accountKey(task.AccountID), "target", task.TargetTime)
 				b.send(chatID, MsgResumeSkipped(acc.Name, task.TargetTime))
